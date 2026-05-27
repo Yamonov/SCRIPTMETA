@@ -1064,6 +1064,28 @@ Fetch:
 https://raw.githubusercontent.com/Yamonov/Iwashiya_Scripts/main/Illustrator/SCRIPTMETA.txt
 ```
 
+Operational example:
+
+`https://github.com/Yamonov/Iwashiya_Scripts/` is a repository-level entrance
+for users. If scripts are grouped under app-specific directories such as
+`Photoshop` and `Illustrator`, each script-side `Meta-URL` should point to its
+own app directory:
+
+```text
+Meta-URL=https://github.com/Yamonov/Iwashiya_Scripts/tree/main/Photoshop
+Meta-URL=https://github.com/Yamonov/Iwashiya_Scripts/tree/main/Illustrator
+```
+
+Fetch each directory's metadata independently:
+
+```text
+https://raw.githubusercontent.com/Yamonov/Iwashiya_Scripts/main/Photoshop/SCRIPTMETA.txt
+https://raw.githubusercontent.com/Yamonov/Iwashiya_Scripts/main/Illustrator/SCRIPTMETA.txt
+```
+
+Do not treat `https://github.com/Yamonov/Iwashiya_Scripts/tree/main` as a
+directory index to crawl for child `SCRIPTMETA.txt` files.
+
 ### 15.4 Plain URL Mode
 
 Use plain URL mode for all other URLs.
@@ -1879,6 +1901,23 @@ Expected:
 - accept only valid SCRIPTMETA text from that raw URL
 - keep the original GitHub directory URL as the user-facing `resolvedURL`
 - do not parse the GitHub directory page HTML as metadata
+
+### Multiple GitHub Directory Sources
+
+Input `Meta-URL` values:
+
+```text
+https://github.com/Yamonov/Iwashiya_Scripts/tree/main/Photoshop
+https://github.com/Yamonov/Iwashiya_Scripts/tree/main/Illustrator
+```
+
+Expected:
+
+- treat them as two distinct update source groups
+- fetch `https://raw.githubusercontent.com/Yamonov/Iwashiya_Scripts/main/Photoshop/SCRIPTMETA.txt`
+- fetch `https://raw.githubusercontent.com/Yamonov/Iwashiya_Scripts/main/Illustrator/SCRIPTMETA.txt`
+- do not fetch or parse `https://github.com/Yamonov/Iwashiya_Scripts/tree/main` to discover child directories
+- keep each original GitHub directory URL as that source's user-facing `resolvedURL`
 
 ### Distribution Page Without Self URL
 

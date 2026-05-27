@@ -407,6 +407,26 @@ Meta-URL=https://github.com/Yamonov/Iwashiya_Scripts/tree/main/Illustrator
 
 この場合、利用者が `Meta-URL` を開くと `Illustrator` ディレクトリが表示され、そこから JSX を選択して確認やダウンロードができます。クライアントは更新判定のために、同じディレクトリ内の `SCRIPTMETA.txt` を raw テキストとして取得します。
 
+運用サンプル:
+
+[Yamonov/Iwashiya_Scripts](https://github.com/Yamonov/Iwashiya_Scripts/) では、リポジトリ直下をスクリプト集の入口にし、`Photoshop`、`Illustrator` などのアプリ別ディレクトリに JSX と `SCRIPTMETA.txt` を置く構成を想定します。
+
+この構成では、script 側の `Meta-URL` はリポジトリ直下ではなく、対応するアプリ別ディレクトリを指定します。
+
+```text
+Meta-URL=https://github.com/Yamonov/Iwashiya_Scripts/tree/main/Photoshop
+Meta-URL=https://github.com/Yamonov/Iwashiya_Scripts/tree/main/Illustrator
+```
+
+クライアントは、それぞれ次の raw テキストを更新判定の正本として取得します。
+
+```text
+https://raw.githubusercontent.com/Yamonov/Iwashiya_Scripts/main/Photoshop/SCRIPTMETA.txt
+https://raw.githubusercontent.com/Yamonov/Iwashiya_Scripts/main/Illustrator/SCRIPTMETA.txt
+```
+
+`https://github.com/Yamonov/Iwashiya_Scripts/tree/main` のような親ディレクトリ URL は、人が一覧を見るための入口としては使えますが、各ディレクトリ内の `SCRIPTMETA.txt` を自動探索する URL としては扱いません。
+
 ## 10. 配布ページタグの互換ルール
 
 配布ページ側は、v1.2 以降では `SCRIPTMETA-DIST-BEGIN` と `SCRIPTMETA-DIST-END` を使います。
