@@ -79,6 +79,57 @@ otherwise. `META-URL` is accepted as an alias for `Meta-URL`. Network streaming
 marker detection is ASCII case-insensitive for early truncation, but normal block
 extraction and key parsing should use the canonical spellings above.
 
+### Closed v1.4 Syntax
+
+SCRIPTMETA v1.4 is a closed format. Do not invent new block markers, localized
+markers, suffixed keys, aliases, or convenience URL fields.
+
+Recognized block markers:
+
+- `SCRIPTMETA-BEGIN`
+- `SCRIPTMETA-END`
+- `SCRIPTMETA-DIST-BEGIN`
+- `SCRIPTMETA-DIST-END`
+- `Description-BEGIN`
+- `Description-END`
+
+Recognized keys:
+
+- `Script-ID`
+- `Version`
+- `Meta-URL`
+- `META-URL`
+- `Latest-URL`
+- `Latest-Version`
+- `Latest-Page-URL`
+- `Target-App`
+- `Min-Target-Version`
+- `Release-Date`
+- `Description`
+- `Name`
+- `Author`
+- `Edit-Password-SHA256`
+
+Do not create or interpret variants such as:
+
+- `Description-en-BEGIN`
+- `Description-ja-BEGIN`
+- `Name-ja`
+- `Author-en`
+- `Target-App-ja`
+- `Latest-URL-en`
+- `Meta-URL-ja`
+- `URL`
+- `Page-URL`
+- `Self-URL`
+- `Distribution-URL`
+- `Changelog-BEGIN`
+- `Changelog-END`
+
+Localization is not encoded in tag names. If a script author wants localized
+text, it must be ordinary text inside a supported field, usually `Description`.
+SCRIPTMETA v1.4 does not define a `Changelog` field or block.
+
 ### Update Profile
 
 Script-side profile used for update checking.
@@ -136,6 +187,27 @@ Implementation note:
 
 - If a local file contains a valid `Meta-URL`, you may parse it.
 - Do not update-check the item unless `Version` is also present.
+
+### Distribution Page URL Rules
+
+A distribution page does not need to describe its own URL. The source URL is
+already known from the script-side `Meta-URL` or from a previous `Latest-URL`.
+
+In a `SCRIPTMETA-DIST-BEGIN ... SCRIPTMETA-DIST-END` block:
+
+- Write `Version` when this page contains the latest metadata.
+- Write `Latest-URL` only when this page redirects update checking to another
+  SCRIPTMETA information page.
+- Do not write `Meta-URL` in a distribution record. `Meta-URL` is a script-side
+  key.
+- Do not write `URL`, `Page-URL`, `Self-URL`, `Distribution-URL`, or similar
+  self-reference tags.
+- Do not set `Latest-URL` to the current distribution page URL.
+- Do not set `Latest-URL` to the same URL as the script-side `Meta-URL` being
+  fetched.
+
+If the latest metadata is already on the source page or its associated
+`SCRIPTMETA.txt`, write `Version` and omit `Latest-URL`.
 
 ## 2. Local Scan Rules
 
@@ -355,6 +427,10 @@ Known keys:
 - `Edit-Password-SHA256`
 
 This allows partially minified blocks to parse.
+
+Do not add unknown keys to this normalization list. In particular, do not add
+localized or suffixed keys such as `Name-ja` or `Latest-URL-en`, and do not add
+`Changelog` keys for v1.4.
 
 ## 9. Key-Value Parsing
 
@@ -1086,6 +1162,10 @@ Record rules:
 - If a version field exists, it must normalize successfully.
 - `latestPageURL` comes from `Latest-URL`, else `Latest-Page-URL`.
 - If a latest page URL exists, it must normalize successfully.
+- `Meta-URL` inside a distribution record is ignored. It is a script-side key,
+  not a distribution-side key.
+- Unknown fields are ignored. Do not reinterpret unknown fields as canonical
+  SCRIPTMETA fields.
 - If duplicate `Script-ID` records exist, the later parsed record overwrites the earlier one.
 
 ## 19. Distribution Resolution
@@ -1617,6 +1697,15 @@ Do not:
 - parse `Description` from distribution pages for display
 - treat `■ Description-END` as a closing marker
 - add an escape syntax for `Description-END`
+- create localized or suffixed markers such as `Description-en-BEGIN`
+- create localized or suffixed keys such as `Name-ja` or `Latest-URL-en`
+- silently reinterpret unknown keys as supported keys
+- add `Changelog` support for v1.4
+- write `Meta-URL` inside a distribution block
+- write URL self-reference keys such as `URL`, `Page-URL`, `Self-URL`, or
+  `Distribution-URL`
+- set `Latest-URL` to the current distribution page
+- set `Latest-URL` to the same URL as the script-side `Meta-URL` being fetched
 - follow `Latest-URL` without a redirect limit
 - ignore circular `Latest-URL` chains
 - use GitHub Releases as the canonical update source
@@ -1713,6 +1802,28 @@ Description-END です
 本文 Description-END
 ```
 
+### Unsupported Localized Tags
+
+Input:
+
+```text
+SCRIPTMETA-BEGIN
+Script-ID=com.example.localized
+Description-en-BEGIN
+This is not a v1.4 description block.
+Description-en-END
+Name-ja=日本語名
+SCRIPTMETA-END
+```
+
+Expected:
+
+- item is accepted because `Script-ID` exists
+- `Description-en-BEGIN` is not treated as `Description-BEGIN`
+- `Description-en-END` is not treated as `Description-END`
+- `Name-ja` is ignored and is not treated as `Name`
+- no localized or suffixed tag is normalized into a canonical tag
+
 ### Description BEGIN Inside Description
 
 Input:
@@ -1752,6 +1863,51 @@ Expected:
 
 - follow `Latest-URL`
 - do not stop at `Version=1.0`
+
+### GitHub Directory Source Loading
+
+Input `Meta-URL`:
+
+```text
+https://github.com/Yamonov/Iwashiya_Scripts/tree/main/Illustrator
+```
+
+Expected:
+
+- detect GitHub directory mode
+- fetch `https://raw.githubusercontent.com/Yamonov/Iwashiya_Scripts/main/Illustrator/SCRIPTMETA.txt`
+- accept only valid SCRIPTMETA text from that raw URL
+- keep the original GitHub directory URL as the user-facing `resolvedURL`
+- do not parse the GitHub directory page HTML as metadata
+
+### Distribution Page Without Self URL
+
+Correct latest-page distribution record:
+
+```text
+SCRIPTMETA-DIST-BEGIN
+Script-ID=com.example.tool
+Version=1.1
+SCRIPTMETA-DIST-END
+```
+
+Incorrect generated fields:
+
+```text
+Meta-URL=https://example.com/current-scripmeta.txt
+URL=https://example.com/current-scripmeta.txt
+Page-URL=https://example.com/current-scripmeta.txt
+Latest-URL=https://example.com/current-scripmeta.txt
+```
+
+Expected:
+
+- no `Meta-URL` exists in the distribution record
+- no self-reference URL field is required
+- no `Latest-URL` exists when the latest version is already on the fetched page
+- if an unknown URL field exists, ignore it
+- if `Latest-URL` points to the current fetched page, treat it as same-page and
+  do not follow it
 
 ### Legacy Distribution Block Filtering
 
