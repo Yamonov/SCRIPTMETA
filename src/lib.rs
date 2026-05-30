@@ -1,4 +1,4 @@
-#![doc = include_str!("../README.md")]
+#![doc = "Core scanning, metadata parsing, update checking, and watch planning APIs for SCRIPTMETA."]
 #![forbid(unsafe_code)]
 
 pub mod catalog;
