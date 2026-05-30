@@ -1,0 +1,27 @@
+[package]
+name = "scriptmetakit_ffi"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "C ABI bridge for SCRIPTMETAKit."
+publish = false
+
+[lib]
+name = "scriptmetakit_ffi"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+pollster = "0.4"
+scriptmetakit = { path = ".." }
+url = "2"
+
+[features]
+default = []
+blocking-http = ["scriptmetakit/blocking-http"]
+native-watch = ["scriptmetakit/native-watch"]
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
