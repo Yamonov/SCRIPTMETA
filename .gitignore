@@ -1,9 +1,0 @@
-.DS_Store
-target/
-build/
-.build/
-.swiftpm/
-DerivedData/
-xcuserdata/
-*.xcuserstate
-SCRIPTMETAKit/scriptmetakitApp/
