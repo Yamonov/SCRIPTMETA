@@ -2,25 +2,22 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PROJECT="$ROOT/scriptmetakitApp/scriptmetakitApp.xcodeproj"
-SCHEME="scriptmetakitApp"
-APP_NAME="scriptmetakitApp"
-DERIVED_DATA="$ROOT/build/DerivedData"
+cd "$ROOT"
 
-pkill -x "$APP_NAME" 2>/dev/null || true
-
-xcodebuild \
-  -project "$PROJECT" \
-  -scheme "$SCHEME" \
-  -configuration Debug \
-  -derivedDataPath "$DERIVED_DATA" \
-  CODE_SIGNING_ALLOWED=NO \
-  build
-
-APP_PATH="$DERIVED_DATA/Build/Products/Debug/$APP_NAME.app"
-if [[ ! -d "$APP_PATH" ]]; then
-  echo "App bundle was not found: $APP_PATH" >&2
-  exit 1
+if [[ "${1:-}" == "--test" ]]; then
+  shift
+  cargo test --workspace --all-targets --all-features "$@"
+  exit 0
 fi
 
-open -n "$APP_PATH"
+if [[ "${1:-}" == "--clippy" ]]; then
+  shift
+  cargo clippy --workspace --all-targets --all-features -- -D warnings "$@"
+  exit 0
+fi
+
+if [[ "$#" -eq 0 ]]; then
+  set -- --help
+fi
+
+cargo run --example scan_folder -- "$@"
