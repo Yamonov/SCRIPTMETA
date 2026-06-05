@@ -19,6 +19,7 @@ typedef enum SmkStatus {
 
 typedef struct SmkEngine SmkEngine;
 typedef struct SmkScanResult SmkScanResult;
+typedef struct SmkEditResult SmkEditResult;
 
 typedef struct SmkUtf8Slice {
     const uint8_t *ptr;
@@ -39,6 +40,27 @@ typedef struct SmkRootSnapshot {
     SmkUtf8Slice error_message;
 } SmkRootSnapshot;
 
+typedef struct SmkRootRegistration {
+    SmkUtf8Slice root_id;
+    SmkUtf8Slice path;
+    SmkUtf8Slice display_name;
+    uint32_t purpose;
+    uint32_t watch_policy;
+    uint32_t cache_policy;
+    uint32_t refresh_policy;
+    uint32_t priority;
+} SmkRootRegistration;
+
+typedef struct SmkFileIdentity {
+    SmkUtf8Slice stable_id;
+    SmkUtf8Slice volume_id;
+    SmkUtf8Slice file_id;
+    uint8_t has_file_size;
+    uint64_t file_size;
+    uint8_t has_content_modified_at;
+    uint64_t content_modified_at;
+} SmkFileIdentity;
+
 typedef struct SmkFileEntry {
     SmkUtf8Slice display_path;
     SmkUtf8Slice resolved_path;
@@ -50,6 +72,8 @@ typedef struct SmkFileEntry {
     uint64_t file_size;
     uint8_t has_content_modified_at;
     uint64_t content_modified_at;
+    uint8_t has_identity;
+    SmkFileIdentity identity;
     SmkUtf8Slice runtime_kind;
     SmkUtf8Slice shebang;
     uint8_t has_scriptmeta;
@@ -81,6 +105,7 @@ typedef struct SmkScriptItem {
     SmkUtf8Slice name;
     SmkUtf8Slice description;
     SmkUtf8Slice target_app;
+    SmkUtf8Slice min_target_version;
     SmkUtf8Slice meta_url;
     SmkUtf8Slice author;
     SmkUtf8Slice release_date;
@@ -157,6 +182,28 @@ typedef struct SmkScanChangeInfo {
     size_t modified_count;
 } SmkScanChangeInfo;
 
+typedef struct SmkOperationInfo {
+    SmkUtf8Slice status;
+    size_t total_units;
+    size_t completed_units;
+    size_t failed_units;
+    uint8_t cancelled;
+    uint8_t timed_out;
+    SmkUtf8Slice reason_code;
+    SmkUtf8Slice message;
+} SmkOperationInfo;
+
+typedef struct SmkFileIssue {
+    uint8_t has_root_id;
+    SmkUtf8Slice root_id;
+    SmkUtf8Slice path;
+    SmkUtf8Slice code;
+    SmkUtf8Slice message;
+    SmkUtf8Slice path_kind;
+    SmkUtf8Slice resolution_status;
+    uint8_t is_directory;
+} SmkFileIssue;
+
 typedef struct SmkFileEntryChange {
     SmkUtf8Slice root_id;
     SmkUtf8Slice kind;
@@ -170,6 +217,8 @@ typedef struct SmkFileEntryChange {
     uint64_t file_size;
     uint8_t has_content_modified_at;
     uint64_t content_modified_at;
+    uint8_t has_identity;
+    SmkFileIdentity identity;
     SmkUtf8Slice runtime_kind;
     SmkUtf8Slice shebang;
     uint8_t has_scriptmeta;
@@ -231,12 +280,159 @@ typedef struct SmkFileEntryChangeSlice {
     size_t len;
 } SmkFileEntryChangeSlice;
 
+typedef struct SmkFileIssueSlice {
+    const SmkFileIssue *ptr;
+    size_t len;
+} SmkFileIssueSlice;
+
+typedef struct SmkWatchChangeInfo {
+    uint8_t has_watch_change;
+    uint8_t overflowed;
+    size_t path_count;
+    size_t affected_root_count;
+    size_t event_count;
+    size_t ignored_path_count;
+    size_t rename_candidate_count;
+    size_t rescan_target_count;
+} SmkWatchChangeInfo;
+
+typedef struct SmkWatchPathEvent {
+    SmkUtf8Slice root_id;
+    SmkUtf8Slice path;
+    SmkUtf8Slice kind;
+    uint8_t is_directory;
+    SmkUtf8Slice rescan_directory;
+} SmkWatchPathEvent;
+
+typedef struct SmkIgnoredWatchPath {
+    uint8_t has_root_id;
+    SmkUtf8Slice root_id;
+    SmkUtf8Slice path;
+    SmkUtf8Slice reason;
+} SmkIgnoredWatchPath;
+
+typedef struct SmkWatchRenameCandidate {
+    SmkUtf8Slice root_id;
+    SmkUtf8Slice old_path;
+    SmkUtf8Slice new_path;
+    SmkUtf8Slice confidence;
+} SmkWatchRenameCandidate;
+
+typedef struct SmkWatchRescanTarget {
+    SmkUtf8Slice root_id;
+    SmkUtf8Slice path;
+    SmkUtf8Slice reason;
+} SmkWatchRescanTarget;
+
+typedef struct SmkWatchPathEventSlice {
+    const SmkWatchPathEvent *ptr;
+    size_t len;
+} SmkWatchPathEventSlice;
+
+typedef struct SmkIgnoredWatchPathSlice {
+    const SmkIgnoredWatchPath *ptr;
+    size_t len;
+} SmkIgnoredWatchPathSlice;
+
+typedef struct SmkWatchRenameCandidateSlice {
+    const SmkWatchRenameCandidate *ptr;
+    size_t len;
+} SmkWatchRenameCandidateSlice;
+
+typedef struct SmkWatchRescanTargetSlice {
+    const SmkWatchRescanTarget *ptr;
+    size_t len;
+} SmkWatchRescanTargetSlice;
+
+typedef struct SmkScriptMetadataDraft {
+    SmkUtf8Slice script_id;
+    SmkUtf8Slice version;
+    SmkUtf8Slice description;
+    SmkUtf8Slice target_app;
+    SmkUtf8Slice min_target_version;
+    SmkUtf8Slice meta_url;
+    SmkUtf8Slice name;
+    SmkUtf8Slice author;
+    SmkUtf8Slice release_date;
+    SmkUtf8Slice edit_password_sha256;
+} SmkScriptMetadataDraft;
+
+typedef struct SmkScriptMetadataWriteRequest {
+    SmkUtf8Slice file_path;
+    SmkUtf8Slice backup_root_path;
+    uint32_t write_mode;
+    SmkScriptMetadataDraft draft;
+} SmkScriptMetadataWriteRequest;
+
+typedef struct SmkDistributionMetadataDraft {
+    SmkUtf8Slice script_id;
+    SmkUtf8Slice version;
+    SmkUtf8Slice latest_url;
+    SmkUtf8Slice latest_page_url;
+} SmkDistributionMetadataDraft;
+
+typedef struct SmkScriptMetaBackupRecord {
+    SmkUtf8Slice id;
+    uint64_t created_at_millis;
+    SmkUtf8Slice backup_file_name;
+    uint64_t file_size;
+    SmkUtf8Slice reason;
+} SmkScriptMetaBackupRecord;
+
+typedef struct SmkScriptMetadataFileWriteResult {
+    SmkUtf8Slice file_path;
+    SmkUtf8Slice operation;
+    uint8_t has_backup;
+    SmkScriptMetaBackupRecord backup;
+} SmkScriptMetadataFileWriteResult;
+
+typedef struct SmkScriptMetadataEditReadResult {
+    SmkUtf8Slice file_path;
+    SmkScriptMetadataDraft draft;
+    SmkUtf8Slice comment_style;
+    SmkUtf8Slice line_ending;
+    uint8_t has_existing_block;
+    SmkUtf8Slice existing_block_text;
+    SmkUtf8Slice source_fingerprint;
+} SmkScriptMetadataEditReadResult;
+
+typedef struct SmkScriptMetaBackupGeneration {
+    SmkUtf8Slice id;
+    size_t sequence_number;
+    uint64_t created_at_millis;
+    SmkUtf8Slice file_path;
+    uint64_t file_size;
+    SmkUtf8Slice reason;
+    uint8_t is_current_file;
+} SmkScriptMetaBackupGeneration;
+
+typedef struct SmkScriptMetaBackupGenerationSlice {
+    const SmkScriptMetaBackupGeneration *ptr;
+    size_t len;
+} SmkScriptMetaBackupGenerationSlice;
+
 SmkStatus smk_engine_create_default(SmkEngine **out_engine);
 void smk_engine_free(SmkEngine *engine);
 
 SmkStatus smk_engine_last_error(const SmkEngine *engine, SmkUtf8Slice *out_message);
 
 SmkStatus smk_engine_set_resolve_macos_alias(SmkEngine *engine, uint8_t enabled);
+
+SmkStatus smk_engine_set_decompile_compiled_osa_during_scan(SmkEngine *engine, uint8_t enabled);
+
+SmkStatus smk_engine_set_root_preflight_options(
+    SmkEngine *engine,
+    uint8_t reject_trash_roots,
+    uint8_t reject_restricted_roots,
+    uint8_t reject_low_script_density_large_roots,
+    size_t max_scanned_items,
+    uint64_t max_duration_millis,
+    size_t min_scanned_file_count_for_large_root,
+    size_t min_script_ratio_denominator,
+    size_t min_scanned_items_for_time_limit
+);
+
+SmkStatus smk_engine_cancel_current_operation(SmkEngine *engine);
 
 SmkStatus smk_engine_scan_folder(
     SmkEngine *engine,
@@ -258,6 +454,68 @@ SmkStatus smk_engine_scan_folders_with_progress(
     const SmkUtf8Slice *paths_ptr,
     size_t path_count,
     uint8_t check_updates,
+    SmkUpdateProgressCallback progress_callback,
+    void *progress_context,
+    SmkScanResult **out_result
+);
+
+SmkStatus smk_engine_set_roots(
+    SmkEngine *engine,
+    const SmkRootRegistration *roots_ptr,
+    size_t root_count
+);
+
+SmkStatus smk_engine_set_visible_root(
+    SmkEngine *engine,
+    SmkUtf8Slice root_id,
+    uint8_t has_root_id
+);
+
+SmkStatus smk_engine_scan_registered_roots(
+    SmkEngine *engine,
+    uint32_t scan_mode,
+    uint8_t check_updates,
+    SmkScanResult **out_result
+);
+
+SmkStatus smk_engine_scan_roots(
+    SmkEngine *engine,
+    const SmkUtf8Slice *root_ids_ptr,
+    size_t root_id_count,
+    uint32_t scan_mode,
+    uint8_t check_updates,
+    SmkScanResult **out_result
+);
+
+SmkStatus smk_engine_scan_registered_roots_with_progress(
+    SmkEngine *engine,
+    uint32_t scan_mode,
+    uint8_t check_updates,
+    SmkUpdateProgressCallback progress_callback,
+    void *progress_context,
+    SmkScanResult **out_result
+);
+
+SmkStatus smk_engine_scan_roots_with_progress(
+    SmkEngine *engine,
+    const SmkUtf8Slice *root_ids_ptr,
+    size_t root_id_count,
+    uint32_t scan_mode,
+    uint8_t check_updates,
+    SmkUpdateProgressCallback progress_callback,
+    void *progress_context,
+    SmkScanResult **out_result
+);
+
+SmkStatus smk_engine_check_update_item(
+    SmkEngine *engine,
+    const SmkScriptItem *item,
+    SmkScanResult **out_result
+);
+
+SmkStatus smk_engine_check_update_item_with_progress(
+    SmkEngine *engine,
+    const SmkScriptItem *item,
     SmkUpdateProgressCallback progress_callback,
     void *progress_context,
     SmkScanResult **out_result
@@ -342,7 +600,148 @@ SmkStatus smk_scan_result_file_entry_changes(
     SmkFileEntryChangeSlice *out_changes
 );
 
+SmkStatus smk_scan_result_operation_info(
+    const SmkScanResult *result,
+    SmkOperationInfo *out_info
+);
+
+SmkStatus smk_scan_result_file_issues(
+    const SmkScanResult *result,
+    SmkFileIssueSlice *out_issues
+);
+
+SmkStatus smk_scan_result_watch_change_info(
+    const SmkScanResult *result,
+    SmkWatchChangeInfo *out_info
+);
+
+SmkStatus smk_scan_result_watch_events(
+    const SmkScanResult *result,
+    SmkWatchPathEventSlice *out_events
+);
+
+SmkStatus smk_scan_result_ignored_watch_paths(
+    const SmkScanResult *result,
+    SmkIgnoredWatchPathSlice *out_paths
+);
+
+SmkStatus smk_scan_result_watch_rename_candidates(
+    const SmkScanResult *result,
+    SmkWatchRenameCandidateSlice *out_candidates
+);
+
+SmkStatus smk_scan_result_watch_rescan_targets(
+    const SmkScanResult *result,
+    SmkWatchRescanTargetSlice *out_targets
+);
+
 void smk_scan_result_free(SmkScanResult *result);
+
+SmkStatus smk_engine_write_script_metadata_file(
+    SmkEngine *engine,
+    const SmkScriptMetadataWriteRequest *request,
+    SmkEditResult **out_result
+);
+
+SmkStatus smk_engine_read_script_metadata_draft_file(
+    SmkEngine *engine,
+    SmkUtf8Slice file_path,
+    SmkEditResult **out_result
+);
+
+SmkStatus smk_engine_render_distribution_metadata(
+    SmkEngine *engine,
+    const SmkDistributionMetadataDraft *records_ptr,
+    size_t record_count,
+    SmkEditResult **out_result
+);
+
+SmkStatus smk_engine_generate_edit_password_sha256(
+    SmkEngine *engine,
+    SmkUtf8Slice password,
+    SmkEditResult **out_result
+);
+
+SmkStatus smk_engine_verify_edit_password_sha256(
+    SmkEngine *engine,
+    SmkUtf8Slice password,
+    SmkUtf8Slice stored_value,
+    uint8_t *out_is_match
+);
+
+SmkStatus smk_engine_scriptmeta_backup_generations(
+    SmkEngine *engine,
+    SmkUtf8Slice file_path,
+    SmkUtf8Slice backup_root_path,
+    SmkEditResult **out_result
+);
+
+SmkStatus smk_engine_create_scriptmeta_backup(
+    SmkEngine *engine,
+    SmkUtf8Slice file_path,
+    SmkUtf8Slice backup_root_path,
+    uint32_t reason,
+    SmkEditResult **out_result
+);
+
+SmkStatus smk_engine_restore_scriptmeta_backup(
+    SmkEngine *engine,
+    SmkUtf8Slice file_path,
+    SmkUtf8Slice backup_root_path,
+    SmkUtf8Slice generation_id,
+    SmkEditResult **out_result
+);
+
+SmkStatus smk_engine_clear_scriptmeta_backups(
+    SmkEngine *engine,
+    SmkUtf8Slice file_path,
+    SmkUtf8Slice backup_root_path
+);
+
+SmkStatus smk_engine_reset_scriptmeta_backups_with_current_as_initial(
+    SmkEngine *engine,
+    SmkUtf8Slice file_path,
+    SmkUtf8Slice backup_root_path,
+    SmkEditResult **out_result
+);
+
+SmkStatus smk_edit_result_text(
+    const SmkEditResult *result,
+    SmkUtf8Slice *out_text
+);
+
+SmkStatus smk_edit_result_file_write_result(
+    const SmkEditResult *result,
+    SmkScriptMetadataFileWriteResult *out_info
+);
+
+SmkStatus smk_edit_result_metadata_edit_read_result(
+    const SmkEditResult *result,
+    SmkScriptMetadataEditReadResult *out_info
+);
+
+SmkStatus smk_edit_result_existing_lines(
+    const SmkEditResult *result,
+    SmkUtf8SliceSlice *out_lines
+);
+
+SmkStatus smk_edit_result_unknown_lines(
+    const SmkEditResult *result,
+    SmkUtf8SliceSlice *out_lines
+);
+
+SmkStatus smk_edit_result_backup_record(
+    const SmkEditResult *result,
+    uint8_t *out_has_record,
+    SmkScriptMetaBackupRecord *out_record
+);
+
+SmkStatus smk_edit_result_backup_generations(
+    const SmkEditResult *result,
+    SmkScriptMetaBackupGenerationSlice *out_generations
+);
+
+void smk_edit_result_free(SmkEditResult *result);
 
 #ifdef __cplusplus
 }

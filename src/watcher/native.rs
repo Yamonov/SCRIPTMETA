@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 use std::{
     path::{Path, PathBuf},
     sync::{
@@ -8,11 +10,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use notify::{
-    Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
-    event::{CreateKind, ModifyKind, RemoveKind},
-};
-
 use crate::{
     core::{ScriptMetaKitError, ScriptMetaKitResult},
     scanner::ExtensionPolicy,
@@ -20,7 +17,7 @@ use crate::{
 };
 
 pub struct NativeWatcher {
-    watcher: Option<RecommendedWatcher>,
+    platform: Option<platform::PlatformWatcher>,
     receiver: Receiver<RawChangeBatch>,
     worker: Option<JoinHandle<()>>,
 }
@@ -35,17 +32,7 @@ impl NativeWatcher {
         notifier: Option<Arc<dyn Fn() + Send + Sync + 'static>>,
     ) -> ScriptMetaKitResult<Self> {
         let (event_sender, event_receiver) = mpsc::channel();
-        let mut watcher = RecommendedWatcher::new(event_sender, Config::default())
-            .map_err(|error| ScriptMetaKitError::InvalidConfig(error.to_string()))?;
-
-        for root in &plan.physical_roots {
-            watcher
-                .watch(&root.path, RecursiveMode::Recursive)
-                .map_err(|error| ScriptMetaKitError::Io {
-                    path: root.path.clone(),
-                    message: error.to_string(),
-                })?;
-        }
+        let platform = platform::PlatformWatcher::start(plan, event_sender)?;
 
         let debounce_delay = Duration::from_millis(plan.debounce_delay_millis);
         let max_delivery_delay = (plan.max_delivery_delay_millis > 0)
@@ -82,9 +69,9 @@ impl NativeWatcher {
                 };
 
                 match receive_result {
-                    Ok(event_result) => {
+                    Ok(event) => {
                         let (pending_changed, flush_now) = append_event_to_pending(
-                            event_result,
+                            event,
                             &mut pending_paths,
                             &mut pending_overflowed,
                             NativeEventFilter {
@@ -152,7 +139,7 @@ impl NativeWatcher {
         });
 
         Ok(Self {
-            watcher: Some(watcher),
+            platform: Some(platform),
             receiver: batch_receiver,
             worker: Some(worker),
         })
@@ -165,7 +152,7 @@ impl NativeWatcher {
 
 impl Drop for NativeWatcher {
     fn drop(&mut self) {
-        self.watcher.take();
+        self.platform.take();
         if let Some(worker) = self.worker.take()
             && worker.thread().id() != thread::current().id()
         {
@@ -174,20 +161,41 @@ impl Drop for NativeWatcher {
     }
 }
 
+#[derive(Debug)]
+enum NativeFsEvent {
+    Changed {
+        path: PathBuf,
+        may_change_directory_tree: bool,
+        identifies_folder: bool,
+    },
+    Overflow,
+}
+
 fn append_event_to_pending(
-    event_result: notify::Result<Event>,
+    event: NativeFsEvent,
     pending_paths: &mut Vec<PathBuf>,
     pending_overflowed: &mut bool,
     filter: NativeEventFilter<'_>,
 ) -> (bool, bool) {
-    match event_result {
-        Ok(event) => {
-            let mut paths = filtered_event_paths(&event, &filter);
-            if paths.is_empty() {
+    match event {
+        NativeFsEvent::Changed {
+            path,
+            may_change_directory_tree,
+            identifies_folder,
+        } => {
+            if !should_keep_event_path(
+                &path,
+                may_change_directory_tree,
+                identifies_folder,
+                filter.watch_roots,
+                filter.supported_extensions,
+                filter.skip_hidden_paths,
+                filter.skip_package_paths,
+            ) {
                 return (false, false);
             }
 
-            pending_paths.append(&mut paths);
+            pending_paths.push(path);
             pending_paths.sort();
             pending_paths.dedup();
 
@@ -198,7 +206,7 @@ fn append_event_to_pending(
 
             (true, false)
         }
-        Err(_) => {
+        NativeFsEvent::Overflow => {
             mark_pending_overflowed(pending_paths, pending_overflowed, filter.overflow_paths);
             (true, false)
         }
@@ -214,31 +222,10 @@ struct NativeEventFilter<'a> {
     skip_package_paths: bool,
 }
 
-fn filtered_event_paths(event: &Event, filter: &NativeEventFilter<'_>) -> Vec<PathBuf> {
-    if matches!(event.kind, EventKind::Access(_)) {
-        return Vec::new();
-    }
-
-    event
-        .paths
-        .iter()
-        .filter(|path| {
-            should_keep_event_path(
-                path,
-                event.kind,
-                filter.watch_roots,
-                filter.supported_extensions,
-                filter.skip_hidden_paths,
-                filter.skip_package_paths,
-            )
-        })
-        .cloned()
-        .collect()
-}
-
 fn should_keep_event_path(
     path: &Path,
-    event_kind: EventKind,
+    may_change_directory_tree: bool,
+    identifies_folder: bool,
     watch_roots: &[PathBuf],
     supported_extensions: &ExtensionPolicy,
     skip_hidden_paths: bool,
@@ -256,31 +243,11 @@ fn should_keep_event_path(
         return true;
     }
 
-    if !event_kind_may_change_directory_tree(event_kind) {
+    if !may_change_directory_tree {
         return false;
     }
 
-    event_kind_identifies_folder(event_kind)
-        || path_is_existing_directory(path)
-        || path.extension().is_none()
-}
-
-fn event_kind_may_change_directory_tree(event_kind: EventKind) -> bool {
-    matches!(
-        event_kind,
-        EventKind::Any
-            | EventKind::Other
-            | EventKind::Create(CreateKind::Any | CreateKind::Folder | CreateKind::Other)
-            | EventKind::Remove(RemoveKind::Any | RemoveKind::Folder | RemoveKind::Other)
-            | EventKind::Modify(ModifyKind::Any | ModifyKind::Name(_) | ModifyKind::Other)
-    )
-}
-
-fn event_kind_identifies_folder(event_kind: EventKind) -> bool {
-    matches!(
-        event_kind,
-        EventKind::Create(CreateKind::Folder) | EventKind::Remove(RemoveKind::Folder)
-    )
+    identifies_folder || path_is_existing_directory(path) || path.extension().is_none()
 }
 
 fn path_has_hidden_component(path: &Path, watch_roots: &[PathBuf]) -> bool {
@@ -389,4 +356,521 @@ fn flush_pending_batch(
         notifier();
     }
     true
+}
+
+#[cfg(target_os = "macos")]
+mod platform {
+    use std::{
+        ffi::{CStr, c_void},
+        os::raw::c_char,
+        path::PathBuf,
+        ptr,
+        sync::mpsc,
+        thread::{self, JoinHandle},
+    };
+
+    use fsevent_sys as fs;
+    use fsevent_sys::core_foundation as cf;
+
+    use super::{NativeFsEvent, ScriptMetaKitError, ScriptMetaKitResult, WatchPlan};
+
+    pub struct PlatformWatcher {
+        paths: cf::CFMutableArrayRef,
+        run_loop: Option<CFSendWrapper>,
+        worker: Option<JoinHandle<()>>,
+    }
+
+    struct StreamContext {
+        sender: mpsc::Sender<NativeFsEvent>,
+    }
+
+    struct CFSendWrapper(usize);
+
+    unsafe impl Send for CFSendWrapper {}
+
+    impl PlatformWatcher {
+        pub fn start(
+            plan: &WatchPlan,
+            event_sender: mpsc::Sender<NativeFsEvent>,
+        ) -> ScriptMetaKitResult<Self> {
+            let paths = unsafe {
+                cf::CFArrayCreateMutable(cf::kCFAllocatorDefault, 0, &cf::kCFTypeArrayCallBacks)
+            };
+            if paths.is_null() {
+                return Err(ScriptMetaKitError::InvalidConfig(
+                    "failed to allocate FSEvents path array".to_string(),
+                ));
+            }
+
+            if plan.physical_roots.is_empty() {
+                return Ok(Self {
+                    paths,
+                    run_loop: None,
+                    worker: None,
+                });
+            }
+
+            for root in &plan.physical_roots {
+                append_watch_path(paths, &root.path)?;
+            }
+
+            let context = Box::into_raw(Box::new(StreamContext {
+                sender: event_sender,
+            }));
+            let stream_context = fs::FSEventStreamContext {
+                version: 0,
+                info: context as *mut c_void,
+                retain: None,
+                release: Some(release_context),
+                copy_description: None,
+            };
+
+            let stream = unsafe {
+                fs::FSEventStreamCreate(
+                    cf::kCFAllocatorDefault,
+                    callback,
+                    &stream_context,
+                    paths,
+                    fs::kFSEventStreamEventIdSinceNow,
+                    0.0,
+                    fs::kFSEventStreamCreateFlagFileEvents | fs::kFSEventStreamCreateFlagNoDefer,
+                )
+            };
+
+            if stream.is_null() {
+                unsafe {
+                    drop(Box::from_raw(context));
+                    cf::CFRelease(paths);
+                }
+                return Err(ScriptMetaKitError::InvalidConfig(
+                    "failed to create FSEvents stream".to_string(),
+                ));
+            }
+
+            let stream = CFSendWrapper(stream as usize);
+            let (run_loop_sender, run_loop_receiver) = mpsc::channel();
+            let worker = thread::Builder::new()
+                .name("scriptmetakit-fsevents".to_string())
+                .spawn(move || {
+                    let stream = stream.0 as fs::FSEventStreamRef;
+                    unsafe {
+                        let run_loop = cf::CFRunLoopGetCurrent();
+                        fs::FSEventStreamScheduleWithRunLoop(
+                            stream,
+                            run_loop,
+                            cf::kCFRunLoopDefaultMode,
+                        );
+                        let started = fs::FSEventStreamStart(stream) != 0;
+                        let _ = run_loop_sender
+                            .send(started.then_some(CFSendWrapper(run_loop as usize)));
+                        if started {
+                            cf::CFRunLoopRun();
+                            fs::FSEventStreamStop(stream);
+                        }
+                        fs::FSEventStreamInvalidate(stream);
+                        fs::FSEventStreamRelease(stream);
+                    }
+                })
+                .map_err(|error| ScriptMetaKitError::InvalidConfig(error.to_string()))?;
+
+            let run_loop = run_loop_receiver
+                .recv()
+                .map_err(|error| ScriptMetaKitError::InvalidConfig(error.to_string()))?;
+            let Some(run_loop) = run_loop else {
+                let _ = worker.join();
+                unsafe {
+                    cf::CFRelease(paths);
+                }
+                return Err(ScriptMetaKitError::InvalidConfig(
+                    "failed to start FSEvents stream".to_string(),
+                ));
+            };
+
+            Ok(Self {
+                paths,
+                run_loop: Some(run_loop),
+                worker: Some(worker),
+            })
+        }
+    }
+
+    impl Drop for PlatformWatcher {
+        fn drop(&mut self) {
+            if let Some(run_loop) = self.run_loop.take() {
+                unsafe {
+                    cf::CFRunLoopStop(run_loop.0 as cf::CFRunLoopRef);
+                }
+            }
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+            unsafe {
+                cf::CFRelease(self.paths);
+            }
+        }
+    }
+
+    fn append_watch_path(
+        paths: cf::CFMutableArrayRef,
+        path: &std::path::Path,
+    ) -> ScriptMetaKitResult<()> {
+        let Some(path) = path.to_str() else {
+            return Err(ScriptMetaKitError::InvalidConfig(
+                "watch path is not valid UTF-8".to_string(),
+            ));
+        };
+
+        let mut error = ptr::null_mut();
+        let cf_path = unsafe { cf::str_path_to_cfstring_ref(path, &mut error) };
+        if cf_path.is_null() {
+            if !error.is_null() {
+                unsafe {
+                    cf::CFRelease(error as cf::CFRef);
+                }
+            }
+            return Err(ScriptMetaKitError::Io {
+                path: PathBuf::from(path),
+                message: "failed to create FSEvents path reference".to_string(),
+            });
+        }
+
+        unsafe {
+            cf::CFArrayAppendValue(paths, cf_path);
+            cf::CFRelease(cf_path);
+        }
+        Ok(())
+    }
+
+    extern "C" fn release_context(info: *const c_void) {
+        if !info.is_null() {
+            unsafe {
+                drop(Box::from_raw(info as *mut StreamContext));
+            }
+        }
+    }
+
+    extern "C" fn callback(
+        _stream_ref: fs::FSEventStreamRef,
+        info: *mut c_void,
+        num_events: usize,
+        event_paths: *mut c_void,
+        event_flags: *const fs::FSEventStreamEventFlags,
+        _event_ids: *const fs::FSEventStreamEventId,
+    ) {
+        if info.is_null() || event_paths.is_null() || event_flags.is_null() {
+            return;
+        }
+
+        let context = unsafe { &*(info as *const StreamContext) };
+        let paths = event_paths as *const *const c_char;
+        for index in 0..num_events {
+            let raw_path = unsafe { *paths.add(index) };
+            if raw_path.is_null() {
+                continue;
+            }
+            let Ok(path) = unsafe { CStr::from_ptr(raw_path) }.to_str() else {
+                continue;
+            };
+            let flags = unsafe { *event_flags.add(index) };
+            let event = event_from_flags(PathBuf::from(path), flags);
+            let _ = context.sender.send(event);
+        }
+    }
+
+    fn event_from_flags(path: PathBuf, flags: fs::FSEventStreamEventFlags) -> NativeFsEvent {
+        if flags
+            & (fs::kFSEventStreamEventFlagMustScanSubDirs
+                | fs::kFSEventStreamEventFlagUserDropped
+                | fs::kFSEventStreamEventFlagKernelDropped
+                | fs::kFSEventStreamEventFlagEventIdsWrapped)
+            != 0
+        {
+            return NativeFsEvent::Overflow;
+        }
+
+        let may_change_directory_tree = flags
+            & (fs::kFSEventStreamEventFlagItemCreated
+                | fs::kFSEventStreamEventFlagItemRemoved
+                | fs::kFSEventStreamEventFlagItemRenamed
+                | fs::kFSEventStreamEventFlagRootChanged
+                | fs::kFSEventStreamEventFlagMount
+                | fs::kFSEventStreamEventFlagUnmount)
+            != 0;
+        let identifies_folder = flags & fs::kFSEventStreamEventFlagItemIsDir != 0;
+
+        NativeFsEvent::Changed {
+            path,
+            may_change_directory_tree,
+            identifies_folder,
+        }
+    }
+}
+
+#[cfg(windows)]
+mod platform {
+    use std::{
+        ffi::{OsString, c_void},
+        mem,
+        os::windows::ffi::{OsStrExt, OsStringExt},
+        path::{Path, PathBuf},
+        ptr, slice,
+        sync::mpsc,
+        thread::{self, JoinHandle},
+    };
+
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, FALSE, HANDLE, INVALID_HANDLE_VALUE, TRUE, WAIT_OBJECT_0},
+        Storage::FileSystem::{
+            CreateFileW, FILE_ACTION_ADDED, FILE_ACTION_REMOVED, FILE_ACTION_RENAMED_NEW_NAME,
+            FILE_ACTION_RENAMED_OLD_NAME, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OVERLAPPED,
+            FILE_LIST_DIRECTORY, FILE_NOTIFY_CHANGE_ATTRIBUTES, FILE_NOTIFY_CHANGE_CREATION,
+            FILE_NOTIFY_CHANGE_DIR_NAME, FILE_NOTIFY_CHANGE_FILE_NAME,
+            FILE_NOTIFY_CHANGE_LAST_WRITE, FILE_NOTIFY_CHANGE_SECURITY, FILE_NOTIFY_CHANGE_SIZE,
+            FILE_NOTIFY_INFORMATION, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            OPEN_EXISTING, ReadDirectoryChangesW,
+        },
+        System::{
+            IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED},
+            Threading::{CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects},
+        },
+    };
+
+    use super::{NativeFsEvent, ScriptMetaKitError, ScriptMetaKitResult, WatchPlan};
+
+    const BUFFER_SIZE: usize = 64 * 1024;
+
+    pub struct PlatformWatcher {
+        stop_events: Vec<isize>,
+        workers: Vec<JoinHandle<()>>,
+    }
+
+    impl PlatformWatcher {
+        pub fn start(
+            plan: &WatchPlan,
+            event_sender: mpsc::Sender<NativeFsEvent>,
+        ) -> ScriptMetaKitResult<Self> {
+            let mut stop_events = Vec::new();
+            let mut workers = Vec::new();
+
+            for root in &plan.physical_roots {
+                let directory = open_directory(&root.path)?;
+                let stop_event = unsafe { CreateEventW(ptr::null(), TRUE, FALSE, ptr::null()) };
+                if stop_event.is_null() || stop_event == INVALID_HANDLE_VALUE {
+                    unsafe {
+                        CloseHandle(directory);
+                    }
+                    return Err(ScriptMetaKitError::Io {
+                        path: root.path.clone(),
+                        message: "failed to create Windows watcher stop event".to_string(),
+                    });
+                }
+
+                let root_path = root.path.clone();
+                let sender = event_sender.clone();
+                let directory_value = directory as isize;
+                let stop_event_value = stop_event as isize;
+                let worker = thread::Builder::new()
+                    .name("scriptmetakit-read-directory-changes".to_string())
+                    .spawn(move || {
+                        watch_root(
+                            root_path,
+                            directory_value as HANDLE,
+                            stop_event_value as HANDLE,
+                            sender,
+                        );
+                    })
+                    .map_err(|error| ScriptMetaKitError::InvalidConfig(error.to_string()))?;
+
+                stop_events.push(stop_event as isize);
+                workers.push(worker);
+            }
+
+            Ok(Self {
+                stop_events,
+                workers,
+            })
+        }
+    }
+
+    impl Drop for PlatformWatcher {
+        fn drop(&mut self) {
+            for stop_event in &self.stop_events {
+                unsafe {
+                    SetEvent(*stop_event as HANDLE);
+                }
+            }
+            for worker in self.workers.drain(..) {
+                let _ = worker.join();
+            }
+            for stop_event in self.stop_events.drain(..) {
+                unsafe {
+                    CloseHandle(stop_event as HANDLE);
+                }
+            }
+        }
+    }
+
+    fn open_directory(path: &Path) -> ScriptMetaKitResult<HANDLE> {
+        let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let handle = unsafe {
+            CreateFileW(
+                wide_path.as_ptr(),
+                FILE_LIST_DIRECTORY,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
+                ptr::null_mut(),
+            )
+        };
+
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return Err(ScriptMetaKitError::Io {
+                path: path.to_path_buf(),
+                message: "failed to open directory for ReadDirectoryChangesW".to_string(),
+            });
+        }
+
+        Ok(handle)
+    }
+
+    fn watch_root(
+        root: PathBuf,
+        directory: HANDLE,
+        stop_event: HANDLE,
+        sender: mpsc::Sender<NativeFsEvent>,
+    ) {
+        loop {
+            let mut buffer = [0u8; BUFFER_SIZE];
+            let mut overlapped: OVERLAPPED = unsafe { mem::zeroed() };
+            let read_event = unsafe { CreateEventW(ptr::null(), TRUE, FALSE, ptr::null()) };
+            if read_event.is_null() || read_event == INVALID_HANDLE_VALUE {
+                let _ = sender.send(NativeFsEvent::Overflow);
+                break;
+            }
+            overlapped.hEvent = read_event;
+
+            let mut bytes_returned = 0u32;
+            let read_started = unsafe {
+                ReadDirectoryChangesW(
+                    directory,
+                    buffer.as_mut_ptr() as *mut c_void,
+                    buffer.len() as u32,
+                    TRUE,
+                    FILE_NOTIFY_CHANGE_FILE_NAME
+                        | FILE_NOTIFY_CHANGE_DIR_NAME
+                        | FILE_NOTIFY_CHANGE_ATTRIBUTES
+                        | FILE_NOTIFY_CHANGE_SIZE
+                        | FILE_NOTIFY_CHANGE_LAST_WRITE
+                        | FILE_NOTIFY_CHANGE_CREATION
+                        | FILE_NOTIFY_CHANGE_SECURITY,
+                    &mut bytes_returned,
+                    &mut overlapped,
+                    None,
+                )
+            };
+
+            if read_started == 0 {
+                unsafe {
+                    CloseHandle(read_event);
+                }
+                let _ = sender.send(NativeFsEvent::Overflow);
+                break;
+            }
+
+            let wait_handles = [stop_event, read_event];
+            let wait_result =
+                unsafe { WaitForMultipleObjects(2, wait_handles.as_ptr(), FALSE, INFINITE) };
+            if wait_result == WAIT_OBJECT_0 {
+                unsafe {
+                    CancelIoEx(directory, &overlapped);
+                    CloseHandle(read_event);
+                }
+                break;
+            }
+
+            let mut transferred = 0u32;
+            let completed =
+                unsafe { GetOverlappedResult(directory, &overlapped, &mut transferred, FALSE) };
+            unsafe {
+                CloseHandle(read_event);
+            }
+
+            if completed == 0 {
+                let _ = sender.send(NativeFsEvent::Overflow);
+                break;
+            }
+
+            if transferred == 0 {
+                let _ = sender.send(NativeFsEvent::Overflow);
+                continue;
+            }
+
+            parse_change_buffer(&root, &buffer[..transferred as usize], &sender);
+        }
+
+        unsafe {
+            CloseHandle(directory);
+        }
+    }
+
+    fn parse_change_buffer(root: &Path, buffer: &[u8], sender: &mpsc::Sender<NativeFsEvent>) {
+        let mut offset = 0usize;
+        while offset < buffer.len() {
+            let entry_ptr = unsafe { buffer.as_ptr().add(offset) };
+            let entry = unsafe { ptr::read_unaligned(entry_ptr as *const FILE_NOTIFY_INFORMATION) };
+            let name_offset = offset + mem::offset_of!(FILE_NOTIFY_INFORMATION, FileName);
+            let name_len = entry.FileNameLength as usize / 2;
+            if name_offset + name_len * 2 > buffer.len() {
+                let _ = sender.send(NativeFsEvent::Overflow);
+                break;
+            }
+
+            let name = unsafe {
+                OsString::from_wide(slice::from_raw_parts(
+                    buffer.as_ptr().add(name_offset) as *const u16,
+                    name_len,
+                ))
+            };
+            let path = root.join(PathBuf::from(name));
+            let may_change_directory_tree = matches!(
+                entry.Action,
+                FILE_ACTION_ADDED
+                    | FILE_ACTION_REMOVED
+                    | FILE_ACTION_RENAMED_OLD_NAME
+                    | FILE_ACTION_RENAMED_NEW_NAME
+            );
+
+            let _ = sender.send(NativeFsEvent::Changed {
+                path,
+                may_change_directory_tree,
+                identifies_folder: false,
+            });
+
+            if entry.NextEntryOffset == 0 {
+                break;
+            }
+            offset += entry.NextEntryOffset as usize;
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+mod platform {
+    use std::sync::mpsc;
+
+    use super::{NativeFsEvent, ScriptMetaKitError, ScriptMetaKitResult, WatchPlan};
+
+    pub struct PlatformWatcher;
+
+    impl PlatformWatcher {
+        pub fn start(
+            _plan: &WatchPlan,
+            _event_sender: mpsc::Sender<NativeFsEvent>,
+        ) -> ScriptMetaKitResult<Self> {
+            Err(ScriptMetaKitError::InvalidConfig(
+                "native watcher is implemented for macOS and Windows".to_string(),
+            ))
+        }
+    }
 }

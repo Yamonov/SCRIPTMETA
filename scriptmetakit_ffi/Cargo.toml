@@ -1,6 +1,6 @@
 [package]
 name = "scriptmetakit_ffi"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.94"
 description = "C ABI bridge for SCRIPTMETAKit."
@@ -9,6 +9,7 @@ publish = false
 [lib]
 name = "scriptmetakit_ffi"
 crate-type = ["cdylib", "staticlib", "rlib"]
+doctest = false
 
 [dependencies]
 pollster = "0.4"

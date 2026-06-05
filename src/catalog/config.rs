@@ -9,6 +9,9 @@ use crate::{
     },
 };
 
+pub const DEFAULT_UPDATE_REQUEST_TIMEOUT_MILLIS: u64 = 15_000;
+pub const DEFAULT_UPDATE_RESOURCE_TIMEOUT_MILLIS: u64 = 15_000;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScriptMetaKitConfig {
     pub app_id: String,
@@ -76,7 +79,9 @@ pub struct UpdateCheckOptions {
     pub enabled: bool,
     pub max_concurrent_meta_url_checks: usize,
     pub retry_attempts: usize,
+    #[serde(default = "default_update_request_timeout_millis")]
     pub request_timeout_millis: Option<u64>,
+    #[serde(default = "default_update_resource_timeout_millis")]
     pub resource_timeout_millis: Option<u64>,
     pub cache_network_responses: bool,
 }
@@ -86,12 +91,20 @@ impl Default for UpdateCheckOptions {
         Self {
             enabled: true,
             max_concurrent_meta_url_checks: 6,
-            retry_attempts: 1,
-            request_timeout_millis: None,
-            resource_timeout_millis: None,
+            retry_attempts: 2,
+            request_timeout_millis: default_update_request_timeout_millis(),
+            resource_timeout_millis: default_update_resource_timeout_millis(),
             cache_network_responses: false,
         }
     }
+}
+
+fn default_update_request_timeout_millis() -> Option<u64> {
+    Some(DEFAULT_UPDATE_REQUEST_TIMEOUT_MILLIS)
+}
+
+fn default_update_resource_timeout_millis() -> Option<u64> {
+    Some(DEFAULT_UPDATE_RESOURCE_TIMEOUT_MILLIS)
 }
 
 impl ScriptMetaKitConfig {

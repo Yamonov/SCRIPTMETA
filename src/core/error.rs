@@ -8,6 +8,7 @@ pub enum ScriptMetaKitError {
     Parse(String),
     Url(String),
     Io { path: PathBuf, message: String },
+    Timeout(String),
     Cache(String),
     NotImplemented(String),
 }
@@ -19,6 +20,7 @@ impl fmt::Display for ScriptMetaKitError {
             Self::Parse(message) => write!(formatter, "parse error: {message}"),
             Self::Url(message) => write!(formatter, "url error: {message}"),
             Self::Io { path, message } => write!(formatter, "{}: {message}", path.display()),
+            Self::Timeout(message) => write!(formatter, "timeout: {message}"),
             Self::Cache(message) => write!(formatter, "cache error: {message}"),
             Self::NotImplemented(message) => write!(formatter, "not implemented: {message}"),
         }
@@ -33,6 +35,7 @@ impl ScriptMetaKitError {
             Self::Parse(_) => "parse_error",
             Self::Url(_) => "url_error",
             Self::Io { .. } => "io_error",
+            Self::Timeout(_) => "timeout",
             Self::Cache(_) => "cache_error",
             Self::NotImplemented(_) => "not_implemented",
         }

@@ -1,9 +1,11 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::RootId;
+
+pub type ScriptMetaItemRef = Arc<ScriptMetaItem>;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ParserOptions {
@@ -33,6 +35,7 @@ pub struct ScriptMetadata {
     pub version: Option<String>,
     pub description: Option<String>,
     pub target_app: Option<String>,
+    pub min_target_version: Option<String>,
     pub meta_url: Option<Url>,
     pub latest_url: Option<Url>,
     pub latest_version: Option<String>,
@@ -123,6 +126,7 @@ pub struct ScriptMetaItem {
     pub version: Option<String>,
     pub description: Option<String>,
     pub target_app: Option<String>,
+    pub min_target_version: Option<String>,
     pub meta_url: Option<Url>,
     pub name: Option<String>,
     pub author: Option<String>,
@@ -162,6 +166,7 @@ impl ScriptMetaItem {
             version: metadata.version,
             description: metadata.description,
             target_app: metadata.target_app,
+            min_target_version: metadata.min_target_version,
             meta_url: metadata.meta_url,
             name: metadata.name,
             author: metadata.author,

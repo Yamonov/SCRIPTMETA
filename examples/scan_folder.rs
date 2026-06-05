@@ -61,9 +61,7 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_default();
         let update_result = pollster::block_on(engine.check_updates(UpdateCheckRequest { items }))?;
         if args.json {
-            if let Some(catalog) = &mut result.catalog_snapshot {
-                catalog.update_check_result = Some(update_result.clone());
-            }
+            result.update_check_result = Some(update_result);
             println!("{}", serde_json::to_string_pretty(&result)?);
             return Ok(());
         }
