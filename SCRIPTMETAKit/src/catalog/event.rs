@@ -105,5 +105,6 @@ pub enum UpdateCheckProgressPhase {
     Retrying,
     FinishedItem,
     FailedItem,
+    Cancelled,
     Finished,
 }

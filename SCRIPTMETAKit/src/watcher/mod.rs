@@ -7,7 +7,9 @@ mod policy;
 pub use native::NativeWatcher;
 pub use plan::{
     DEFAULT_DEBOUNCE_DELAY_MILLIS, DEFAULT_MAX_DELIVERY_DELAY_MILLIS, DEFAULT_MAX_PENDING_PATHS,
-    LogicalWatchRoot, PhysicalWatchRoot, RawChangeBatch, RootChange, RootChangeBatch, WatchPlan,
+    IgnoredWatchPath, LogicalWatchRoot, PhysicalWatchRoot, RawChangeBatch, RootChange,
+    RootChangeBatch, WatchIgnoreReason, WatchPathEvent, WatchPathEventKind, WatchPlan,
+    WatchRenameCandidate, WatchRenameConfidence, WatchRescanReason, WatchRescanTarget,
     build_watch_plan,
 };
 pub use policy::{MonitorRootStrategy, OverflowPolicy, WatchPolicy};

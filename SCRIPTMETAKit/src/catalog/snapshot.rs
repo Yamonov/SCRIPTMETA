@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, path::PathBuf};
+use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use url::Url;
@@ -6,7 +6,10 @@ use uuid::Uuid;
 
 use crate::{
     ItemId, RootId, TimestampMillis,
-    core::{DistributionResolution, ScriptMetaItem, ScriptMetaKitError, ScriptRuntimeKind},
+    core::{
+        DistributionResolution, FileIssue, OperationSummary, ScriptMetaItem, ScriptMetaItemRef,
+        ScriptMetaKitError, ScriptRuntimeKind,
+    },
     scanner::{CandidateCache, FileSystemEntry, PathKind, PathResolutionStatus},
 };
 
@@ -17,6 +20,21 @@ pub struct DirectoryState {
     pub modification_time_millis: Option<TimestampMillis>,
     pub child_count: usize,
     pub child_fingerprint: u64,
+    #[serde(default)]
+    pub identity: Option<FileIdentity>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FileIdentity {
+    pub stable_id: String,
+    #[serde(default)]
+    pub volume_id: Option<String>,
+    #[serde(default)]
+    pub file_id: Option<String>,
+    #[serde(default)]
+    pub file_size: Option<u64>,
+    #[serde(default)]
+    pub content_modified_at: Option<TimestampMillis>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -58,6 +76,7 @@ pub enum RootStatus {
     Unreadable,
     TimedOut,
     Overflowed,
+    Cancelled,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -78,10 +97,9 @@ pub struct FileListSnapshot {
 pub struct ScriptMetaCatalogSnapshot {
     pub source_revision: Uuid,
     pub roots: Vec<RootSnapshot>,
-    pub all_items: Vec<ScriptMetaItem>,
-    pub file_items: Vec<ScriptMetaItem>,
+    pub all_items: Vec<ScriptMetaItemRef>,
+    pub file_items: Vec<ScriptMetaItemRef>,
     pub candidate_cache: CandidateCache,
-    pub update_check_result: Option<UpdateCheckResult>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -128,10 +146,37 @@ impl ScanMode {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScanResult {
     pub roots: Vec<RootSnapshot>,
-    pub file_list_snapshots: Vec<FileListSnapshot>,
-    pub catalog_snapshot: Option<ScriptMetaCatalogSnapshot>,
+    pub file_list_snapshots: Vec<Arc<FileListSnapshot>>,
+    pub catalog_snapshot: Option<Arc<ScriptMetaCatalogSnapshot>>,
+    #[serde(default)]
+    pub operation: OperationSummary,
+    #[serde(default)]
+    pub file_issues: Vec<FileIssue>,
+    #[serde(default)]
+    pub update_check_result: Option<UpdateCheckResult>,
     #[serde(default)]
     pub change_summary: Option<ScanChangeSummary>,
+    #[serde(default)]
+    pub watch_change_batch: Option<crate::watcher::RootChangeBatch>,
+}
+
+impl ScanResult {
+    pub fn flattened_file_entries(&self) -> impl Iterator<Item = &FileSystemEntry> {
+        self.file_list_snapshots
+            .iter()
+            .filter_map(|snapshot| snapshot.children.as_deref())
+            .flat_map(flatten_file_entries)
+    }
+}
+
+fn flatten_file_entries(
+    entries: &[FileSystemEntry],
+) -> Box<dyn Iterator<Item = &FileSystemEntry> + '_> {
+    Box::new(
+        entries
+            .iter()
+            .flat_map(|entry| std::iter::once(entry).chain(flatten_file_entries(&entry.children))),
+    )
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -186,6 +231,8 @@ pub struct FileEntryChange {
     pub can_append_scriptmeta: bool,
     #[serde(default)]
     pub scriptmeta_edit_state: crate::core::ScriptMetaEditState,
+    #[serde(default)]
+    pub identity: Option<FileIdentity>,
 }
 
 impl FileEntryChange {
@@ -211,6 +258,7 @@ impl FileEntryChange {
             can_edit_scriptmeta: entry.can_edit_scriptmeta,
             can_append_scriptmeta: entry.can_append_scriptmeta,
             scriptmeta_edit_state: entry.scriptmeta_edit_state,
+            identity: entry.identity.clone(),
         }
     }
 }
@@ -225,12 +273,14 @@ pub enum FileEntryChangeKind {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UpdateCheckRequest {
-    pub items: Vec<ScriptMetaItem>,
+    pub items: Vec<ScriptMetaItemRef>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct UpdateCheckResult {
     pub checked_at: TimestampMillis,
+    #[serde(default)]
+    pub operation: OperationSummary,
     pub resolutions_by_item_id: BTreeMap<ItemId, DistributionResolution>,
     #[serde(default)]
     pub failures_by_item_id: BTreeMap<ItemId, UpdateFailure>,
@@ -321,6 +371,7 @@ pub enum UpdateStatus {
     UpdateAvailable,
     Failed,
     NotCheckable,
+    Cancelled,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

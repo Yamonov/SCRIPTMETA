@@ -1,22 +1,35 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
-#[cfg(feature = "native-watch")]
-use std::sync::Arc;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ffi::c_void,
     panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     ptr, slice, str,
+    sync::Arc,
 };
 
 use scriptmetakit::{
-    CachePolicy, DistributionResolution, FileEntryChange, FileEntryChangeKind, FileListSnapshot,
-    FileSystemEntry, RefreshPolicy, RootPriority, RootPurpose, RootRegistration, RootSnapshot,
-    RootStatus, ScanChangeSummary, ScanMode, ScanRequest, ScanResult, ScriptMetaItem,
-    ScriptMetaKitConfig, ScriptMetaKitEngine, ScriptRuntimeKind, UpdateCheckProgress,
-    UpdateCheckProgressPhase, UpdateCheckRequest, UpdateCheckResult, UpdateFailure, UpdateStatus,
-    WatchPolicy,
+    CachePolicy, DistributionMetadataDraft as KitDistributionMetadataDraft, DistributionResolution,
+    FileEntryChange, FileEntryChangeKind, FileIdentity, FileIssue, FileListSnapshot,
+    FileSystemEntry, IgnoredWatchPath, OperationSummary, RefreshPolicy, RootChangeBatch,
+    RootPriority, RootPurpose, RootRegistration, RootSnapshot, RootStatus, ScanChangeSummary,
+    ScanMode, ScanRequest, ScanResult, ScriptMetaBackupGeneration as KitScriptMetaBackupGeneration,
+    ScriptMetaBackupOptions, ScriptMetaBackupReason,
+    ScriptMetaBackupRecord as KitScriptMetaBackupRecord, ScriptMetaEditState, ScriptMetaItem,
+    ScriptMetaKitConfig, ScriptMetaKitEngine, ScriptMetaWriteMode, ScriptMetaWriteOperation,
+    ScriptMetadataDraft as KitScriptMetadataDraft,
+    ScriptMetadataEditPreviewResult as KitScriptMetadataEditPreviewResult,
+    ScriptMetadataEditReadResult as KitScriptMetadataEditReadResult,
+    ScriptMetadataFileWriteResult as KitScriptMetadataFileWriteResult, ScriptRuntimeKind,
+    UpdateCheckProgress, UpdateCheckProgressPhase, UpdateCheckResult, UpdateFailure, UpdateStatus,
+    WatchIgnoreReason, WatchPathEvent, WatchPathEventKind, WatchPolicy, WatchRenameCandidate,
+    WatchRenameConfidence, WatchRescanReason, WatchRescanTarget, clear_scriptmeta_backups,
+    create_scriptmeta_backup, generate_edit_password_sha256, is_valid_edit_password_sha256,
+    normalize_metadata_url, normalize_version_string, read_script_metadata_draft_from_file,
+    read_script_metadata_edit_preview_from_file, render_distribution_metadata_block,
+    reset_scriptmeta_backups_with_current_as_initial, restore_scriptmeta_backup,
+    scriptmeta_backup_generations, verify_edit_password_sha256, write_script_metadata_to_file,
 };
 use url::Url;
 
@@ -74,6 +87,31 @@ pub struct SmkRootSnapshot {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct SmkRootRegistration {
+    pub root_id: SmkUtf8Slice,
+    pub path: SmkUtf8Slice,
+    pub display_name: SmkUtf8Slice,
+    pub purpose: u32,
+    pub watch_policy: u32,
+    pub cache_policy: u32,
+    pub refresh_policy: u32,
+    pub priority: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkFileIdentity {
+    pub stable_id: SmkUtf8Slice,
+    pub volume_id: SmkUtf8Slice,
+    pub file_id: SmkUtf8Slice,
+    pub has_file_size: u8,
+    pub file_size: u64,
+    pub has_content_modified_at: u8,
+    pub content_modified_at: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct SmkFileEntry {
     pub display_path: SmkUtf8Slice,
     pub resolved_path: SmkUtf8Slice,
@@ -85,6 +123,8 @@ pub struct SmkFileEntry {
     pub file_size: u64,
     pub has_content_modified_at: u8,
     pub content_modified_at: u64,
+    pub has_identity: u8,
+    pub identity: SmkFileIdentity,
     pub runtime_kind: SmkUtf8Slice,
     pub shebang: SmkUtf8Slice,
     pub has_scriptmeta: u8,
@@ -120,6 +160,7 @@ pub struct SmkScriptItem {
     pub name: SmkUtf8Slice,
     pub description: SmkUtf8Slice,
     pub target_app: SmkUtf8Slice,
+    pub min_target_version: SmkUtf8Slice,
     pub meta_url: SmkUtf8Slice,
     pub author: SmkUtf8Slice,
     pub release_date: SmkUtf8Slice,
@@ -211,6 +252,32 @@ pub struct SmkScanChangeInfo {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct SmkOperationInfo {
+    pub status: SmkUtf8Slice,
+    pub total_units: usize,
+    pub completed_units: usize,
+    pub failed_units: usize,
+    pub cancelled: u8,
+    pub timed_out: u8,
+    pub reason_code: SmkUtf8Slice,
+    pub message: SmkUtf8Slice,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkFileIssue {
+    pub has_root_id: u8,
+    pub root_id: SmkUtf8Slice,
+    pub path: SmkUtf8Slice,
+    pub code: SmkUtf8Slice,
+    pub message: SmkUtf8Slice,
+    pub path_kind: SmkUtf8Slice,
+    pub resolution_status: SmkUtf8Slice,
+    pub is_directory: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct SmkFileEntryChange {
     pub root_id: SmkUtf8Slice,
     pub kind: SmkUtf8Slice,
@@ -224,6 +291,8 @@ pub struct SmkFileEntryChange {
     pub file_size: u64,
     pub has_content_modified_at: u8,
     pub content_modified_at: u64,
+    pub has_identity: u8,
+    pub identity: SmkFileIdentity,
     pub runtime_kind: SmkUtf8Slice,
     pub shebang: SmkUtf8Slice,
     pub has_scriptmeta: u8,
@@ -305,8 +374,192 @@ pub struct SmkFileEntryChangeSlice {
     pub len: usize,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkFileIssueSlice {
+    pub ptr: *const SmkFileIssue,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkWatchChangeInfo {
+    pub has_watch_change: u8,
+    pub overflowed: u8,
+    pub path_count: usize,
+    pub affected_root_count: usize,
+    pub event_count: usize,
+    pub ignored_path_count: usize,
+    pub rename_candidate_count: usize,
+    pub rescan_target_count: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkWatchPathEvent {
+    pub root_id: SmkUtf8Slice,
+    pub path: SmkUtf8Slice,
+    pub kind: SmkUtf8Slice,
+    pub is_directory: u8,
+    pub rescan_directory: SmkUtf8Slice,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkIgnoredWatchPath {
+    pub has_root_id: u8,
+    pub root_id: SmkUtf8Slice,
+    pub path: SmkUtf8Slice,
+    pub reason: SmkUtf8Slice,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkWatchRenameCandidate {
+    pub root_id: SmkUtf8Slice,
+    pub old_path: SmkUtf8Slice,
+    pub new_path: SmkUtf8Slice,
+    pub confidence: SmkUtf8Slice,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkWatchRescanTarget {
+    pub root_id: SmkUtf8Slice,
+    pub path: SmkUtf8Slice,
+    pub reason: SmkUtf8Slice,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkWatchPathEventSlice {
+    pub ptr: *const SmkWatchPathEvent,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkIgnoredWatchPathSlice {
+    pub ptr: *const SmkIgnoredWatchPath,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkWatchRenameCandidateSlice {
+    pub ptr: *const SmkWatchRenameCandidate,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkWatchRescanTargetSlice {
+    pub ptr: *const SmkWatchRescanTarget,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkScriptMetadataDraft {
+    pub script_id: SmkUtf8Slice,
+    pub version: SmkUtf8Slice,
+    pub description: SmkUtf8Slice,
+    pub target_app: SmkUtf8Slice,
+    pub min_target_version: SmkUtf8Slice,
+    pub meta_url: SmkUtf8Slice,
+    pub name: SmkUtf8Slice,
+    pub author: SmkUtf8Slice,
+    pub release_date: SmkUtf8Slice,
+    pub edit_password_sha256: SmkUtf8Slice,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkScriptMetadataWriteRequest {
+    pub file_path: SmkUtf8Slice,
+    pub backup_root_path: SmkUtf8Slice,
+    pub write_mode: u32,
+    pub draft: SmkScriptMetadataDraft,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkDistributionMetadataDraft {
+    pub script_id: SmkUtf8Slice,
+    pub version: SmkUtf8Slice,
+    pub latest_url: SmkUtf8Slice,
+    pub latest_page_url: SmkUtf8Slice,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkScriptMetaBackupRecord {
+    pub id: SmkUtf8Slice,
+    pub created_at_millis: u64,
+    pub backup_file_name: SmkUtf8Slice,
+    pub file_size: u64,
+    pub reason: SmkUtf8Slice,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkScriptMetadataFileWriteResult {
+    pub file_path: SmkUtf8Slice,
+    pub operation: SmkUtf8Slice,
+    pub has_backup: u8,
+    pub backup: SmkScriptMetaBackupRecord,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkScriptMetadataEditReadResult {
+    pub file_path: SmkUtf8Slice,
+    pub draft: SmkScriptMetadataDraft,
+    pub comment_style: SmkUtf8Slice,
+    pub line_ending: SmkUtf8Slice,
+    pub has_existing_block: u8,
+    pub existing_block_text: SmkUtf8Slice,
+    pub source_fingerprint: SmkUtf8Slice,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkScriptMetadataEditPreviewResult {
+    pub file_path: SmkUtf8Slice,
+    pub preview_text: SmkUtf8Slice,
+    pub preview_byte_count: usize,
+    pub file_size: u64,
+    pub has_file_size: u8,
+    pub comment_style: SmkUtf8Slice,
+    pub line_ending: SmkUtf8Slice,
+    pub has_scriptmeta_marker_in_preview: u8,
+    pub is_truncated: u8,
+    pub requires_full_read: u8,
+    pub file_state_fingerprint: SmkUtf8Slice,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkScriptMetaBackupGeneration {
+    pub id: SmkUtf8Slice,
+    pub sequence_number: usize,
+    pub created_at_millis: u64,
+    pub file_path: SmkUtf8Slice,
+    pub file_size: u64,
+    pub reason: SmkUtf8Slice,
+    pub is_current_file: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkScriptMetaBackupGenerationSlice {
+    pub ptr: *const SmkScriptMetaBackupGeneration,
+    pub len: usize,
+}
+
 pub struct SmkEngine {
     engine: ScriptMetaKitEngine,
+    cancellation: scriptmetakit::OperationCancellation,
     last_error: Vec<u8>,
     #[cfg(feature = "native-watch")]
     watcher: Option<NativeWatcher>,
@@ -314,6 +567,7 @@ pub struct SmkEngine {
 
 pub struct SmkScanResult {
     string_storage: Vec<u8>,
+    string_index: BTreeMap<String, SmkUtf8Slice>,
     roots: Vec<SmkRootSnapshot>,
     file_lists: Vec<SmkFileListSnapshot>,
     file_entries: Vec<SmkFileEntry>,
@@ -327,6 +581,26 @@ pub struct SmkScanResult {
     latest_url_history_urls: Vec<SmkUtf8Slice>,
     change_info: SmkScanChangeInfo,
     file_entry_changes: Vec<SmkFileEntryChange>,
+    operation_info: SmkOperationInfo,
+    file_issues: Vec<SmkFileIssue>,
+    watch_info: SmkWatchChangeInfo,
+    watch_events: Vec<SmkWatchPathEvent>,
+    ignored_watch_paths: Vec<SmkIgnoredWatchPath>,
+    watch_rename_candidates: Vec<SmkWatchRenameCandidate>,
+    watch_rescan_targets: Vec<SmkWatchRescanTarget>,
+}
+
+pub struct SmkEditResult {
+    string_storage: Vec<u8>,
+    text: SmkUtf8Slice,
+    file_write_result: SmkScriptMetadataFileWriteResult,
+    edit_read_result: SmkScriptMetadataEditReadResult,
+    edit_preview_result: SmkScriptMetadataEditPreviewResult,
+    existing_lines: Vec<SmkUtf8Slice>,
+    unknown_lines: Vec<SmkUtf8Slice>,
+    has_backup_record: u8,
+    backup_record: SmkScriptMetaBackupRecord,
+    backup_generations: Vec<SmkScriptMetaBackupGeneration>,
 }
 
 #[unsafe(no_mangle)]
@@ -341,8 +615,10 @@ pub unsafe extern "C" fn smk_engine_create_default(out_engine: *mut *mut SmkEngi
         config.watcher.watch_policy = WatchPolicy::AllRegistered;
         let engine = ScriptMetaKitEngine::new(config)
             .map_err(|error| (SmkStatus::EngineError, error.to_string()))?;
+        let cancellation = engine.cancellation_token();
         let handle = Box::new(SmkEngine {
             engine,
+            cancellation,
             last_error: Vec::new(),
             #[cfg(feature = "native-watch")]
             watcher: None,
@@ -398,6 +674,99 @@ pub unsafe extern "C" fn smk_engine_set_resolve_macos_alias(
         let engine = engine_mut(engine)?;
         engine.clear_error();
         engine.engine.config_mut().scanner.resolve_macos_alias = enabled != 0;
+        Ok(())
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine` must be a live engine handle returned by
+/// `smk_engine_create_default`.
+pub unsafe extern "C" fn smk_engine_set_decompile_compiled_osa_during_scan(
+    engine: *mut SmkEngine,
+    enabled: u8,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        engine.clear_error();
+        engine
+            .engine
+            .config_mut()
+            .scanner
+            .decompile_compiled_osa_during_scan = enabled != 0;
+        Ok(())
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine` must be a live engine handle returned by
+/// `smk_engine_create_default`.
+pub unsafe extern "C" fn smk_engine_set_root_preflight_options(
+    engine: *mut SmkEngine,
+    reject_trash_roots: u8,
+    reject_restricted_roots: u8,
+    reject_low_script_density_large_roots: u8,
+    max_scanned_items: usize,
+    max_duration_millis: u64,
+    min_scanned_file_count_for_large_root: usize,
+    min_script_ratio_denominator: usize,
+    min_scanned_items_for_time_limit: usize,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        engine.clear_error();
+        let preflight = &mut engine.engine.config_mut().scanner.root_preflight;
+        preflight.reject_trash_roots = reject_trash_roots != 0;
+        preflight.reject_restricted_roots = reject_restricted_roots != 0;
+        preflight.reject_low_script_density_large_roots =
+            reject_low_script_density_large_roots != 0;
+        preflight.max_scanned_items = max_scanned_items;
+        preflight.max_duration_millis = max_duration_millis;
+        preflight.min_scanned_file_count_for_large_root = min_scanned_file_count_for_large_root;
+        preflight.min_script_ratio_denominator = min_script_ratio_denominator;
+        preflight.min_scanned_items_for_time_limit = min_scanned_items_for_time_limit;
+        Ok(())
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine` must be a live engine handle returned by
+/// `smk_engine_create_default`. The function only sets an atomic cancellation
+/// flag and is intended to be callable while another operation is running.
+pub unsafe extern "C" fn smk_engine_cancel_current_operation(engine: *mut SmkEngine) -> SmkStatus {
+    let status = ffi_guard(|| {
+        if engine.is_null() {
+            return Err((
+                SmkStatus::NullArgument,
+                "engine pointer was null".to_string(),
+            ));
+        }
+        // SAFETY: `engine` is a live handle. This only touches the cancellation
+        // token, which is internally atomic and intentionally separate from the
+        // mutable engine state used by long-running operations.
+        unsafe {
+            (*engine).cancellation.cancel();
+        }
         Ok(())
     });
 
@@ -523,6 +892,341 @@ pub unsafe extern "C" fn smk_engine_scan_folders_with_progress(
         ) {
             Ok(result) => {
                 *out_result = Box::into_raw(Box::new(result));
+                Ok(())
+            }
+            Err(error) => {
+                let message = error.to_string();
+                engine.set_error(&message);
+                Err((SmkStatus::EngineError, message))
+            }
+        }
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine` must be a live engine handle. `roots_ptr` must point to
+/// `root_count` readable `SmkRootRegistration` values for the duration of the
+/// call. String slices must contain valid UTF-8. This configures roots without
+/// scanning them.
+pub unsafe extern "C" fn smk_engine_set_roots(
+    engine: *mut SmkEngine,
+    roots_ptr: *const SmkRootRegistration,
+    root_count: usize,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        engine.clear_error();
+        let roots = root_registrations_from_raw(roots_ptr, root_count)?;
+
+        match engine.engine.set_roots(roots) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let message = error.to_string();
+                engine.set_error(&message);
+                Err((SmkStatus::EngineError, message))
+            }
+        }
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine` must be a live engine handle. When `has_root_id` is non-zero,
+/// `root_id` must contain valid UTF-8 for the duration of this call. Passing
+/// `has_root_id=0` clears the visible root.
+pub unsafe extern "C" fn smk_engine_set_visible_root(
+    engine: *mut SmkEngine,
+    root_id: SmkUtf8Slice,
+    has_root_id: u8,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        engine.clear_error();
+        let root_id = if has_root_id == 0 {
+            None
+        } else {
+            Some(required_str_from_slice(root_id, "root_id")?.to_string())
+        };
+        engine.engine.set_visible_root(root_id);
+        Ok(())
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine` must be a live engine handle with roots configured by
+/// `smk_engine_set_roots`. `scan_mode` uses 0=file_list_only,
+/// 1=metadata_only, 2=file_list_and_metadata. `out_result` must be writable.
+/// A non-null result must be released with `smk_scan_result_free`.
+pub unsafe extern "C" fn smk_engine_scan_registered_roots(
+    engine: *mut SmkEngine,
+    scan_mode: u32,
+    check_updates: u8,
+    out_result: *mut *mut SmkScanResult,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        let out_result = out_mut(out_result)?;
+        *out_result = ptr::null_mut();
+        engine.clear_error();
+        let scan_mode = scan_mode_from_u32(scan_mode)?;
+
+        match scan_registered_roots(
+            &mut engine.engine,
+            scan_mode,
+            check_updates != 0,
+            None,
+            ptr::null_mut(),
+        ) {
+            Ok(result) => {
+                *out_result = Box::into_raw(Box::new(result));
+                Ok(())
+            }
+            Err(error) => {
+                let message = error.to_string();
+                engine.set_error(&message);
+                Err((SmkStatus::EngineError, message))
+            }
+        }
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine` must be a live engine handle with roots configured by
+/// `smk_engine_set_roots`. `root_ids_ptr` must point to `root_id_count`
+/// readable `SmkUtf8Slice` values for the duration of the call, unless
+/// `root_id_count` is zero. `scan_mode` uses 0=file_list_only,
+/// 1=metadata_only, 2=file_list_and_metadata. `out_result` must be writable.
+/// A non-null result must be released with `smk_scan_result_free`.
+pub unsafe extern "C" fn smk_engine_scan_roots(
+    engine: *mut SmkEngine,
+    root_ids_ptr: *const SmkUtf8Slice,
+    root_id_count: usize,
+    scan_mode: u32,
+    check_updates: u8,
+    out_result: *mut *mut SmkScanResult,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        let out_result = out_mut(out_result)?;
+        *out_result = ptr::null_mut();
+        engine.clear_error();
+        let root_ids = root_ids_from_raw(root_ids_ptr, root_id_count)?;
+        let scan_mode = scan_mode_from_u32(scan_mode)?;
+
+        match scan_selected_roots(
+            &mut engine.engine,
+            root_ids,
+            scan_mode,
+            check_updates != 0,
+            None,
+            ptr::null_mut(),
+        ) {
+            Ok(result) => {
+                *out_result = Box::into_raw(Box::new(result));
+                Ok(())
+            }
+            Err(error) => {
+                let message = error.to_string();
+                engine.set_error(&message);
+                Err((SmkStatus::EngineError, message))
+            }
+        }
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// Same as `smk_engine_scan_registered_roots`, with a synchronous progress
+/// callback during update checks.
+pub unsafe extern "C" fn smk_engine_scan_registered_roots_with_progress(
+    engine: *mut SmkEngine,
+    scan_mode: u32,
+    check_updates: u8,
+    progress_callback: SmkUpdateProgressCallback,
+    progress_context: *mut c_void,
+    out_result: *mut *mut SmkScanResult,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        let out_result = out_mut(out_result)?;
+        *out_result = ptr::null_mut();
+        engine.clear_error();
+        let scan_mode = scan_mode_from_u32(scan_mode)?;
+
+        match scan_registered_roots(
+            &mut engine.engine,
+            scan_mode,
+            check_updates != 0,
+            progress_callback,
+            progress_context,
+        ) {
+            Ok(result) => {
+                *out_result = Box::into_raw(Box::new(result));
+                Ok(())
+            }
+            Err(error) => {
+                let message = error.to_string();
+                engine.set_error(&message);
+                Err((SmkStatus::EngineError, message))
+            }
+        }
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// Same as `smk_engine_scan_roots`, with a synchronous progress callback during
+/// update checks.
+pub unsafe extern "C" fn smk_engine_scan_roots_with_progress(
+    engine: *mut SmkEngine,
+    root_ids_ptr: *const SmkUtf8Slice,
+    root_id_count: usize,
+    scan_mode: u32,
+    check_updates: u8,
+    progress_callback: SmkUpdateProgressCallback,
+    progress_context: *mut c_void,
+    out_result: *mut *mut SmkScanResult,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        let out_result = out_mut(out_result)?;
+        *out_result = ptr::null_mut();
+        engine.clear_error();
+        let root_ids = root_ids_from_raw(root_ids_ptr, root_id_count)?;
+        let scan_mode = scan_mode_from_u32(scan_mode)?;
+
+        match scan_selected_roots(
+            &mut engine.engine,
+            root_ids,
+            scan_mode,
+            check_updates != 0,
+            progress_callback,
+            progress_context,
+        ) {
+            Ok(result) => {
+                *out_result = Box::into_raw(Box::new(result));
+                Ok(())
+            }
+            Err(error) => {
+                let message = error.to_string();
+                engine.set_error(&message);
+                Err((SmkStatus::EngineError, message))
+            }
+        }
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine` must be a live engine handle. `item` must point to a readable
+/// `SmkScriptItem` whose string slices contain valid UTF-8 for the duration of
+/// the call. `out_result` must be a valid, writable pointer. A non-null result
+/// must be released with `smk_scan_result_free`.
+pub unsafe extern "C" fn smk_engine_check_update_item(
+    engine: *mut SmkEngine,
+    item: *const SmkScriptItem,
+    out_result: *mut *mut SmkScanResult,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        let out_result = out_mut(out_result)?;
+        *out_result = ptr::null_mut();
+        engine.clear_error();
+        let item = Arc::new(script_item_from_ffi(input_ref(item, "item")?)?);
+
+        match pollster::block_on(engine.engine.check_update_for_item(item)) {
+            Ok(result) => {
+                *out_result = Box::into_raw(Box::new(SmkScanResult::from_update_result(result)));
+                Ok(())
+            }
+            Err(error) => {
+                let message = error.to_string();
+                engine.set_error(&message);
+                Err((SmkStatus::EngineError, message))
+            }
+        }
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// Same as `smk_engine_check_update_item`, with a synchronous progress callback
+/// during the update check. Strings in `SmkUpdateProgress` are valid only for
+/// the duration of that callback.
+pub unsafe extern "C" fn smk_engine_check_update_item_with_progress(
+    engine: *mut SmkEngine,
+    item: *const SmkScriptItem,
+    progress_callback: SmkUpdateProgressCallback,
+    progress_context: *mut c_void,
+    out_result: *mut *mut SmkScanResult,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        let out_result = out_mut(out_result)?;
+        *out_result = ptr::null_mut();
+        engine.clear_error();
+        let item = Arc::new(script_item_from_ffi(input_ref(item, "item")?)?);
+
+        match pollster::block_on(
+            engine
+                .engine
+                .check_update_for_item_with_progress(item, |progress| {
+                    emit_update_progress(progress_callback, progress_context, &progress)
+                }),
+        ) {
+            Ok(result) => {
+                *out_result = Box::into_raw(Box::new(SmkScanResult::from_update_result(result)));
                 Ok(())
             }
             Err(error) => {
@@ -887,6 +1591,43 @@ pub unsafe extern "C" fn smk_scan_result_change_info(
 #[unsafe(no_mangle)]
 /// # Safety
 ///
+/// `result` must be a live scan result handle. `out_info` must be a valid,
+/// writable pointer.
+pub unsafe extern "C" fn smk_scan_result_operation_info(
+    result: *const SmkScanResult,
+    out_info: *mut SmkOperationInfo,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = scan_result_ref(result)?;
+        let out_info = out_mut(out_info)?;
+        *out_info = result.operation_info;
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `result` must be a live scan result handle. `out_issues` must be a valid,
+/// writable pointer. The returned slice is borrowed from `result`.
+pub unsafe extern "C" fn smk_scan_result_file_issues(
+    result: *const SmkScanResult,
+    out_issues: *mut SmkFileIssueSlice,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = scan_result_ref(result)?;
+        let out_issues = out_mut(out_issues)?;
+        *out_issues = SmkFileIssueSlice {
+            ptr: result.file_issues.as_ptr(),
+            len: result.file_issues.len(),
+        };
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
 /// `result` must be a live scan result handle. `out_changes` must be a valid,
 /// writable pointer. The returned slice is borrowed from `result`.
 pub unsafe extern "C" fn smk_scan_result_file_entry_changes(
@@ -907,9 +1648,692 @@ pub unsafe extern "C" fn smk_scan_result_file_entry_changes(
 #[unsafe(no_mangle)]
 /// # Safety
 ///
+/// `result` must be a live scan result handle. `out_info` must be writable.
+pub unsafe extern "C" fn smk_scan_result_watch_change_info(
+    result: *const SmkScanResult,
+    out_info: *mut SmkWatchChangeInfo,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = scan_result_ref(result)?;
+        let out_info = out_mut(out_info)?;
+        *out_info = result.watch_info;
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `result` must be a live scan result handle. `out_events` must be writable.
+pub unsafe extern "C" fn smk_scan_result_watch_events(
+    result: *const SmkScanResult,
+    out_events: *mut SmkWatchPathEventSlice,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = scan_result_ref(result)?;
+        let out_events = out_mut(out_events)?;
+        *out_events = SmkWatchPathEventSlice {
+            ptr: result.watch_events.as_ptr(),
+            len: result.watch_events.len(),
+        };
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `result` must be a live scan result handle. `out_paths` must be writable.
+pub unsafe extern "C" fn smk_scan_result_ignored_watch_paths(
+    result: *const SmkScanResult,
+    out_paths: *mut SmkIgnoredWatchPathSlice,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = scan_result_ref(result)?;
+        let out_paths = out_mut(out_paths)?;
+        *out_paths = SmkIgnoredWatchPathSlice {
+            ptr: result.ignored_watch_paths.as_ptr(),
+            len: result.ignored_watch_paths.len(),
+        };
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `result` must be a live scan result handle. `out_candidates` must be writable.
+pub unsafe extern "C" fn smk_scan_result_watch_rename_candidates(
+    result: *const SmkScanResult,
+    out_candidates: *mut SmkWatchRenameCandidateSlice,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = scan_result_ref(result)?;
+        let out_candidates = out_mut(out_candidates)?;
+        *out_candidates = SmkWatchRenameCandidateSlice {
+            ptr: result.watch_rename_candidates.as_ptr(),
+            len: result.watch_rename_candidates.len(),
+        };
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `result` must be a live scan result handle. `out_targets` must be writable.
+pub unsafe extern "C" fn smk_scan_result_watch_rescan_targets(
+    result: *const SmkScanResult,
+    out_targets: *mut SmkWatchRescanTargetSlice,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = scan_result_ref(result)?;
+        let out_targets = out_mut(out_targets)?;
+        *out_targets = SmkWatchRescanTargetSlice {
+            ptr: result.watch_rescan_targets.as_ptr(),
+            len: result.watch_rescan_targets.len(),
+        };
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
 /// `result` must be null or a live handle returned by `smk_engine_scan_folder`
 /// or `smk_engine_scan_folders`. Each non-null handle must be freed at most once.
 pub unsafe extern "C" fn smk_scan_result_free(result: *mut SmkScanResult) {
+    if !result.is_null() {
+        // SAFETY: `result` must be a pointer returned by this crate.
+        unsafe {
+            drop(Box::from_raw(result));
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine` must be a live engine handle. `request` must point to a readable
+/// `SmkScriptMetadataWriteRequest` for the duration of the call. Each non-empty
+/// string slice in the request must contain UTF-8. `out_result` must be a valid,
+/// writable pointer. A non-null result must be released with
+/// `smk_edit_result_free`.
+pub unsafe extern "C" fn smk_engine_write_script_metadata_file(
+    engine: *mut SmkEngine,
+    request: *const SmkScriptMetadataWriteRequest,
+    out_result: *mut *mut SmkEditResult,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        let out_result = out_mut(out_result)?;
+        *out_result = ptr::null_mut();
+        engine.clear_error();
+
+        let request = input_ref(request, "script metadata write request")?;
+        let file_path = path_from_slice(request.file_path)?;
+        let backup_root_path = optional_path_from_slice(request.backup_root_path)?;
+        let backup_options =
+            backup_root_path.map(|root_directory| ScriptMetaBackupOptions { root_directory });
+        let draft = script_metadata_draft_from_ffi(&request.draft)?;
+        let mode = script_meta_write_mode(request.write_mode)?;
+
+        match write_script_metadata_to_file(&file_path, &draft, mode, backup_options.as_ref()) {
+            Ok(result) => {
+                *out_result =
+                    Box::into_raw(Box::new(SmkEditResult::from_file_write_result(&result)));
+                Ok(())
+            }
+            Err(error) => {
+                let message = error.to_string();
+                engine.set_error(&message);
+                Err((SmkStatus::EngineError, message))
+            }
+        }
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine` must be a live engine handle. `file_path` must contain UTF-8.
+/// `out_result` must be writable. A non-null result must be released with
+/// `smk_edit_result_free`.
+pub unsafe extern "C" fn smk_engine_read_script_metadata_draft_file(
+    engine: *mut SmkEngine,
+    file_path: SmkUtf8Slice,
+    out_result: *mut *mut SmkEditResult,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        let out_result = out_mut(out_result)?;
+        *out_result = ptr::null_mut();
+        engine.clear_error();
+
+        let file_path = path_from_slice(file_path)?;
+        match read_script_metadata_draft_from_file(&file_path) {
+            Ok(result) => {
+                *out_result =
+                    Box::into_raw(Box::new(SmkEditResult::from_edit_read_result(&result)));
+                Ok(())
+            }
+            Err(error) => {
+                let message = error.to_string();
+                engine.set_error(&message);
+                Err((SmkStatus::EngineError, message))
+            }
+        }
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine` must be a live engine handle. `file_path` must contain UTF-8.
+/// `out_result` must be writable. A non-null result must be released with
+/// `smk_edit_result_free`.
+pub unsafe extern "C" fn smk_engine_read_script_metadata_edit_preview_file(
+    engine: *mut SmkEngine,
+    file_path: SmkUtf8Slice,
+    max_bytes: usize,
+    out_result: *mut *mut SmkEditResult,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        let out_result = out_mut(out_result)?;
+        *out_result = ptr::null_mut();
+        engine.clear_error();
+
+        let file_path = path_from_slice(file_path)?;
+        match read_script_metadata_edit_preview_from_file(&file_path, max_bytes) {
+            Ok(result) => {
+                *out_result =
+                    Box::into_raw(Box::new(SmkEditResult::from_edit_preview_result(&result)));
+                Ok(())
+            }
+            Err(error) => {
+                let message = error.to_string();
+                engine.set_error(&message);
+                Err((SmkStatus::EngineError, message))
+            }
+        }
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine` must be a live engine handle. `records_ptr` must point to
+/// `record_count` readable `SmkDistributionMetadataDraft` values for the
+/// duration of the call. Each non-empty string slice must contain UTF-8.
+/// `out_result` must be a valid, writable pointer. A non-null result must be
+/// released with `smk_edit_result_free`.
+pub unsafe extern "C" fn smk_engine_render_distribution_metadata(
+    engine: *mut SmkEngine,
+    records_ptr: *const SmkDistributionMetadataDraft,
+    record_count: usize,
+    out_result: *mut *mut SmkEditResult,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        let out_result = out_mut(out_result)?;
+        *out_result = ptr::null_mut();
+        engine.clear_error();
+
+        let records = distribution_metadata_drafts_from_raw(records_ptr, record_count)?;
+        match render_distribution_metadata_block(&records) {
+            Ok(text) => {
+                *out_result = Box::into_raw(Box::new(SmkEditResult::from_text(&text)));
+                Ok(())
+            }
+            Err(error) => {
+                let message = error.to_string();
+                engine.set_error(&message);
+                Err((SmkStatus::EngineError, message))
+            }
+        }
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine` must be a live engine handle. `password` must contain UTF-8.
+/// `out_result` must be a valid, writable pointer. A non-null result must be
+/// released with `smk_edit_result_free`.
+pub unsafe extern "C" fn smk_engine_generate_edit_password_sha256(
+    engine: *mut SmkEngine,
+    password: SmkUtf8Slice,
+    out_result: *mut *mut SmkEditResult,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        let out_result = out_mut(out_result)?;
+        *out_result = ptr::null_mut();
+        engine.clear_error();
+
+        let password = required_str_from_slice(password, "edit password")?;
+        match generate_edit_password_sha256(password) {
+            Ok(text) => {
+                *out_result = Box::into_raw(Box::new(SmkEditResult::from_text(&text)));
+                Ok(())
+            }
+            Err(error) => {
+                let message = error.to_string();
+                engine.set_error(&message);
+                Err((SmkStatus::EngineError, message))
+            }
+        }
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine` must be a live engine handle. `password` and `stored_value` must
+/// contain UTF-8. `out_is_match` must be a valid, writable pointer.
+pub unsafe extern "C" fn smk_engine_verify_edit_password_sha256(
+    engine: *mut SmkEngine,
+    password: SmkUtf8Slice,
+    stored_value: SmkUtf8Slice,
+    out_is_match: *mut u8,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        let out_is_match = out_mut(out_is_match)?;
+        engine.clear_error();
+
+        let password = required_str_from_slice(password, "edit password")?;
+        let stored_value = required_str_from_slice(stored_value, "Edit-Password-SHA256")?;
+        if !is_valid_edit_password_sha256(stored_value) {
+            let message = "Edit-Password-SHA256 is invalid".to_string();
+            engine.set_error(&message);
+            return Err((SmkStatus::InvalidArgument, message));
+        }
+        *out_is_match = bool_byte(verify_edit_password_sha256(password, stored_value));
+        Ok(())
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine` must be a live engine handle. `file_path` and `backup_root_path`
+/// must contain valid UTF-8 if non-empty. `out_result` must be a valid,
+/// writable pointer. A non-null result must be released with
+/// `smk_edit_result_free`.
+pub unsafe extern "C" fn smk_engine_scriptmeta_backup_generations(
+    engine: *mut SmkEngine,
+    file_path: SmkUtf8Slice,
+    backup_root_path: SmkUtf8Slice,
+    out_result: *mut *mut SmkEditResult,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        let out_result = out_mut(out_result)?;
+        *out_result = ptr::null_mut();
+        engine.clear_error();
+
+        let file_path = path_from_slice(file_path)?;
+        let backup_options = backup_options_from_slice(backup_root_path)?;
+        match scriptmeta_backup_generations(&file_path, &backup_options) {
+            Ok(generations) => {
+                *out_result = Box::into_raw(Box::new(SmkEditResult::from_backup_generations(
+                    &generations,
+                )));
+                Ok(())
+            }
+            Err(error) => {
+                let message = error.to_string();
+                engine.set_error(&message);
+                Err((SmkStatus::EngineError, message))
+            }
+        }
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine` must be a live engine handle. `file_path` and `backup_root_path`
+/// must contain valid UTF-8 if non-empty. `out_result` must be a valid,
+/// writable pointer. A non-null result must be released with
+/// `smk_edit_result_free`.
+pub unsafe extern "C" fn smk_engine_create_scriptmeta_backup(
+    engine: *mut SmkEngine,
+    file_path: SmkUtf8Slice,
+    backup_root_path: SmkUtf8Slice,
+    reason: u32,
+    out_result: *mut *mut SmkEditResult,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        let out_result = out_mut(out_result)?;
+        *out_result = ptr::null_mut();
+        engine.clear_error();
+
+        let file_path = path_from_slice(file_path)?;
+        let backup_options = backup_options_from_slice(backup_root_path)?;
+        let reason = script_meta_backup_reason(reason)?;
+        match create_scriptmeta_backup(&file_path, &backup_options, reason) {
+            Ok(record) => {
+                *out_result = Box::into_raw(Box::new(SmkEditResult::from_backup_record(&record)));
+                Ok(())
+            }
+            Err(error) => {
+                let message = error.to_string();
+                engine.set_error(&message);
+                Err((SmkStatus::EngineError, message))
+            }
+        }
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine` must be a live engine handle. `file_path`, `backup_root_path`, and
+/// `generation_id` must contain valid UTF-8 if non-empty. `out_result` must be
+/// a valid, writable pointer. A non-null result must be released with
+/// `smk_edit_result_free`.
+pub unsafe extern "C" fn smk_engine_restore_scriptmeta_backup(
+    engine: *mut SmkEngine,
+    file_path: SmkUtf8Slice,
+    backup_root_path: SmkUtf8Slice,
+    generation_id: SmkUtf8Slice,
+    out_result: *mut *mut SmkEditResult,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        let out_result = out_mut(out_result)?;
+        *out_result = ptr::null_mut();
+        engine.clear_error();
+
+        let file_path = path_from_slice(file_path)?;
+        let backup_options = backup_options_from_slice(backup_root_path)?;
+        let generation_id = required_str_from_slice(generation_id, "generation id")?;
+        match restore_scriptmeta_backup(&file_path, &backup_options, generation_id) {
+            Ok(record) => {
+                *out_result = Box::into_raw(Box::new(SmkEditResult::from_backup_record(&record)));
+                Ok(())
+            }
+            Err(error) => {
+                let message = error.to_string();
+                engine.set_error(&message);
+                Err((SmkStatus::EngineError, message))
+            }
+        }
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine` must be a live engine handle. `file_path` and `backup_root_path`
+/// must contain valid UTF-8 if non-empty.
+pub unsafe extern "C" fn smk_engine_clear_scriptmeta_backups(
+    engine: *mut SmkEngine,
+    file_path: SmkUtf8Slice,
+    backup_root_path: SmkUtf8Slice,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        engine.clear_error();
+
+        let file_path = path_from_slice(file_path)?;
+        let backup_options = backup_options_from_slice(backup_root_path)?;
+        match clear_scriptmeta_backups(&file_path, &backup_options) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                let message = error.to_string();
+                engine.set_error(&message);
+                Err((SmkStatus::EngineError, message))
+            }
+        }
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine` must be a live engine handle. `file_path` and `backup_root_path`
+/// must contain valid UTF-8 if non-empty. `out_result` must be a valid,
+/// writable pointer. A non-null result must be released with
+/// `smk_edit_result_free`.
+pub unsafe extern "C" fn smk_engine_reset_scriptmeta_backups_with_current_as_initial(
+    engine: *mut SmkEngine,
+    file_path: SmkUtf8Slice,
+    backup_root_path: SmkUtf8Slice,
+    out_result: *mut *mut SmkEditResult,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        let out_result = out_mut(out_result)?;
+        *out_result = ptr::null_mut();
+        engine.clear_error();
+
+        let file_path = path_from_slice(file_path)?;
+        let backup_options = backup_options_from_slice(backup_root_path)?;
+        match reset_scriptmeta_backups_with_current_as_initial(&file_path, &backup_options) {
+            Ok(record) => {
+                *out_result = Box::into_raw(Box::new(SmkEditResult::from_backup_record(&record)));
+                Ok(())
+            }
+            Err(error) => {
+                let message = error.to_string();
+                engine.set_error(&message);
+                Err((SmkStatus::EngineError, message))
+            }
+        }
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `result` must be a live edit result handle. `out_text` must be a valid,
+/// writable pointer. The returned slice is borrowed from `result` and remains
+/// valid only until `result` is freed.
+pub unsafe extern "C" fn smk_edit_result_text(
+    result: *const SmkEditResult,
+    out_text: *mut SmkUtf8Slice,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = edit_result_ref(result)?;
+        let out_text = out_mut(out_text)?;
+        *out_text = result.text;
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `result` must be a live edit result handle. `out_info` must be a valid,
+/// writable pointer.
+pub unsafe extern "C" fn smk_edit_result_file_write_result(
+    result: *const SmkEditResult,
+    out_info: *mut SmkScriptMetadataFileWriteResult,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = edit_result_ref(result)?;
+        let out_info = out_mut(out_info)?;
+        *out_info = result.file_write_result;
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `result` must be a live edit result handle. `out_info` must be writable.
+pub unsafe extern "C" fn smk_edit_result_metadata_edit_read_result(
+    result: *const SmkEditResult,
+    out_info: *mut SmkScriptMetadataEditReadResult,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = edit_result_ref(result)?;
+        let out_info = out_mut(out_info)?;
+        *out_info = result.edit_read_result;
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `result` must be a live edit result handle. `out_info` must be writable.
+pub unsafe extern "C" fn smk_edit_result_metadata_edit_preview_result(
+    result: *const SmkEditResult,
+    out_info: *mut SmkScriptMetadataEditPreviewResult,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = edit_result_ref(result)?;
+        let out_info = out_mut(out_info)?;
+        *out_info = result.edit_preview_result;
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `result` must be a live edit result handle. `out_lines` must be writable.
+pub unsafe extern "C" fn smk_edit_result_existing_lines(
+    result: *const SmkEditResult,
+    out_lines: *mut SmkUtf8SliceSlice,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = edit_result_ref(result)?;
+        let out_lines = out_mut(out_lines)?;
+        *out_lines = SmkUtf8SliceSlice {
+            ptr: result.existing_lines.as_ptr(),
+            len: result.existing_lines.len(),
+        };
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `result` must be a live edit result handle. `out_lines` must be writable.
+pub unsafe extern "C" fn smk_edit_result_unknown_lines(
+    result: *const SmkEditResult,
+    out_lines: *mut SmkUtf8SliceSlice,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = edit_result_ref(result)?;
+        let out_lines = out_mut(out_lines)?;
+        *out_lines = SmkUtf8SliceSlice {
+            ptr: result.unknown_lines.as_ptr(),
+            len: result.unknown_lines.len(),
+        };
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `result` must be a live edit result handle. `out_has_record` and
+/// `out_record` must be valid, writable pointers.
+pub unsafe extern "C" fn smk_edit_result_backup_record(
+    result: *const SmkEditResult,
+    out_has_record: *mut u8,
+    out_record: *mut SmkScriptMetaBackupRecord,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = edit_result_ref(result)?;
+        let out_has_record = out_mut(out_has_record)?;
+        let out_record = out_mut(out_record)?;
+        *out_has_record = result.has_backup_record;
+        *out_record = result.backup_record;
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `result` must be a live edit result handle. `out_generations` must be a
+/// valid, writable pointer. The returned slice is borrowed from `result`.
+pub unsafe extern "C" fn smk_edit_result_backup_generations(
+    result: *const SmkEditResult,
+    out_generations: *mut SmkScriptMetaBackupGenerationSlice,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = edit_result_ref(result)?;
+        let out_generations = out_mut(out_generations)?;
+        *out_generations = SmkScriptMetaBackupGenerationSlice {
+            ptr: result.backup_generations.as_ptr(),
+            len: result.backup_generations.len(),
+        };
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `result` must be null or a live handle returned by this crate. Each non-null
+/// handle must be freed at most once.
+pub unsafe extern "C" fn smk_edit_result_free(result: *mut SmkEditResult) {
     if !result.is_null() {
         // SAFETY: `result` must be a pointer returned by this crate.
         unsafe {
@@ -951,7 +2375,7 @@ fn scan_folders(
         .collect();
 
     engine.set_roots(roots)?;
-    let mut scan_result = engine.scan_roots(ScanRequest {
+    let scan_result = engine.scan_roots(ScanRequest {
         root_ids: Vec::new(),
         mode: ScanMode::FileListAndMetadata,
     })?;
@@ -959,16 +2383,67 @@ fn scan_folders(
         let items = scan_result
             .catalog_snapshot
             .as_ref()
-            .map(|snapshot| snapshot.all_items.clone())
-            .unwrap_or_default();
-        let update_result = pollster::block_on(
-            engine.check_updates_with_progress(UpdateCheckRequest { items }, |progress| {
-                emit_update_progress(progress_callback, progress_context, &progress)
-            }),
-        )?;
-        if let Some(snapshot) = scan_result.catalog_snapshot.as_mut() {
-            snapshot.update_check_result = Some(update_result.clone());
-        }
+            .map_or(&[][..], |snapshot| snapshot.file_items.as_slice());
+        let update_result = if progress_callback.is_some() {
+            pollster::block_on(
+                engine.check_updates_for_items_with_progress(items, |progress| {
+                    emit_update_progress(progress_callback, progress_context, &progress)
+                }),
+            )?
+        } else {
+            pollster::block_on(engine.check_updates_for_items(items))?
+        };
+        Some(update_result)
+    } else {
+        None
+    };
+
+    Ok(SmkScanResult::from_scan_result(scan_result, update_result))
+}
+
+fn scan_registered_roots(
+    engine: &mut ScriptMetaKitEngine,
+    scan_mode: ScanMode,
+    check_updates: bool,
+    progress_callback: SmkUpdateProgressCallback,
+    progress_context: *mut c_void,
+) -> scriptmetakit::ScriptMetaKitResult<SmkScanResult> {
+    scan_selected_roots(
+        engine,
+        Vec::new(),
+        scan_mode,
+        check_updates,
+        progress_callback,
+        progress_context,
+    )
+}
+
+fn scan_selected_roots(
+    engine: &mut ScriptMetaKitEngine,
+    root_ids: Vec<String>,
+    scan_mode: ScanMode,
+    check_updates: bool,
+    progress_callback: SmkUpdateProgressCallback,
+    progress_context: *mut c_void,
+) -> scriptmetakit::ScriptMetaKitResult<SmkScanResult> {
+    let scan_result = engine.scan_roots(ScanRequest {
+        root_ids,
+        mode: scan_mode,
+    })?;
+    let update_result = if check_updates {
+        let items = scan_result
+            .catalog_snapshot
+            .as_ref()
+            .map_or(&[][..], |snapshot| snapshot.file_items.as_slice());
+        let update_result = if progress_callback.is_some() {
+            pollster::block_on(
+                engine.check_updates_for_items_with_progress(items, |progress| {
+                    emit_update_progress(progress_callback, progress_context, &progress)
+                }),
+            )?
+        } else {
+            pollster::block_on(engine.check_updates_for_items(items))?
+        };
         Some(update_result)
     } else {
         None
@@ -1032,16 +2507,25 @@ fn poll_watcher_scan(engine: &mut SmkEngine) -> Result<Option<SmkScanResult>, St
     batch.paths.sort();
     batch.paths.dedup();
 
-    engine
+    let change_batch = engine
         .engine
         .mark_changed_paths(batch)
-        .map_err(|error| error.to_string())?;
-    let scan_result = engine
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find_map(|event| match event {
+            scriptmetakit::ScriptMetaKitEvent::ChangeDetected { batch } => Some(batch),
+            _ => None,
+        });
+    let Some(change_batch) = change_batch else {
+        return Ok(None);
+    };
+    let mut scan_result = engine
         .engine
         .refresh_dirty_roots(RefreshRequest {
             mode: ScanMode::FileListAndMetadata,
         })
         .map_err(|error| error.to_string())?;
+    scan_result.watch_change_batch = Some(change_batch);
     Ok(Some(SmkScanResult::from_scan_result(scan_result, None)))
 }
 
@@ -1052,18 +2536,20 @@ fn poll_watcher_scan(_engine: &mut SmkEngine) -> Result<Option<SmkScanResult>, S
 
 impl SmkScanResult {
     fn from_scan_result(scan_result: ScanResult, update_result: Option<UpdateCheckResult>) -> Self {
-        let update_result = update_result.or_else(|| {
-            scan_result
-                .catalog_snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.update_check_result.clone())
-        });
+        let update_result =
+            update_result.or_else(|| scan_result.update_check_result.as_ref().cloned());
+        let operation = update_result
+            .as_ref()
+            .map(|result| &result.operation)
+            .unwrap_or(&scan_result.operation);
         let string_capacity = total_string_bytes(&scan_result, update_result.as_ref());
+        let file_entry_capacity = total_file_entry_count(&scan_result);
         let mut result = Self {
             string_storage: Vec::with_capacity(string_capacity),
+            string_index: BTreeMap::new(),
             roots: Vec::with_capacity(scan_result.roots.len()),
             file_lists: Vec::with_capacity(scan_result.file_list_snapshots.len()),
-            file_entries: Vec::new(),
+            file_entries: Vec::with_capacity(file_entry_capacity),
             items: scan_result
                 .catalog_snapshot
                 .as_ref()
@@ -1084,43 +2570,95 @@ impl SmkScanResult {
             latest_url_history_urls: Vec::new(),
             change_info: SmkScanChangeInfo::default(),
             file_entry_changes: Vec::new(),
+            operation_info: SmkOperationInfo::default(),
+            file_issues: Vec::with_capacity(scan_result.file_issues.len()),
+            watch_info: SmkWatchChangeInfo::default(),
+            watch_events: Vec::new(),
+            ignored_watch_paths: Vec::new(),
+            watch_rename_candidates: Vec::new(),
+            watch_rescan_targets: Vec::new(),
         };
 
+        let root_indices: BTreeMap<_, _> = scan_result
+            .roots
+            .iter()
+            .enumerate()
+            .map(|(index, root)| (root.root_id.as_str(), index))
+            .collect();
         for root in &scan_result.roots {
             result.push_root(root);
         }
+        result.push_operation_info(operation);
+        for issue in &scan_result.file_issues {
+            result.push_file_issue(issue);
+        }
 
-        let root_indices = result.root_index_by_id();
         for snapshot in &scan_result.file_list_snapshots {
             result.push_file_list(snapshot, &root_indices);
         }
 
         if let Some(snapshot) = scan_result.catalog_snapshot.as_ref() {
+            let mut all_item_indices = BTreeMap::new();
             for item in &snapshot.all_items {
+                let item_key = std::sync::Arc::as_ptr(item) as usize;
+                let item_index = result.items.len();
                 result.push_script_item(item);
+                all_item_indices.insert(item_key, item_index);
             }
             for item in &snapshot.file_items {
-                result.push_file_script_item(item);
+                let item_key = std::sync::Arc::as_ptr(item) as usize;
+                if let Some(item_index) = all_item_indices.get(&item_key) {
+                    result.file_items.push(result.items[*item_index]);
+                } else {
+                    result.push_file_script_item(item);
+                }
             }
         }
 
         if let Some(change_summary) = scan_result.change_summary.as_ref() {
             result.push_change_summary(change_summary);
         }
+        if let Some(batch) = scan_result.watch_change_batch.as_ref() {
+            result.push_watch_change_batch(batch);
+        }
 
         if let Some(update_result) = update_result {
             result.push_update_result(&update_result);
         }
 
+        result.string_index.clear();
         result
     }
 
-    fn root_index_by_id(&self) -> BTreeMap<String, usize> {
-        self.roots
-            .iter()
-            .enumerate()
-            .map(|(index, root)| (self.string(root.root_id), index))
-            .collect()
+    fn from_update_result(update_result: UpdateCheckResult) -> Self {
+        let mut result = Self {
+            string_storage: Vec::with_capacity(update_result_string_bytes(&update_result)),
+            string_index: BTreeMap::new(),
+            roots: Vec::new(),
+            file_lists: Vec::new(),
+            file_entries: Vec::new(),
+            items: Vec::new(),
+            file_items: Vec::new(),
+            update_info: SmkUpdateCheckInfo::default(),
+            update_statuses: Vec::new(),
+            update_resolutions: Vec::new(),
+            update_failures: Vec::new(),
+            update_errors: Vec::new(),
+            latest_url_history_urls: Vec::new(),
+            change_info: SmkScanChangeInfo::default(),
+            file_entry_changes: Vec::new(),
+            operation_info: SmkOperationInfo::default(),
+            file_issues: Vec::new(),
+            watch_info: SmkWatchChangeInfo::default(),
+            watch_events: Vec::new(),
+            ignored_watch_paths: Vec::new(),
+            watch_rename_candidates: Vec::new(),
+            watch_rescan_targets: Vec::new(),
+        };
+        result.push_operation_info(&update_result.operation);
+        result.push_update_result(&update_result);
+        result.string_index.clear();
+        result
     }
 
     fn push_root(&mut self, root: &RootSnapshot) {
@@ -1129,7 +2667,7 @@ impl SmkScanResult {
         let ffi_root = SmkRootSnapshot {
             root_id: self.push_string(Some(root.root_id.as_str())),
             path: self.push_path(&root.path),
-            status: self.push_string(Some(root_status(root.status))),
+            status: static_slice(root_status(root.status)),
             is_dirty: bool_byte(root.is_dirty),
             has_last_loaded_at,
             last_loaded_at,
@@ -1143,10 +2681,37 @@ impl SmkScanResult {
         self.roots.push(ffi_root);
     }
 
+    fn push_operation_info(&mut self, operation: &OperationSummary) {
+        self.operation_info = SmkOperationInfo {
+            status: static_slice(operation_status(operation.status)),
+            total_units: operation.total_units,
+            completed_units: operation.completed_units,
+            failed_units: operation.failed_units,
+            cancelled: bool_byte(operation.cancelled),
+            timed_out: bool_byte(operation.timed_out),
+            reason_code: self.push_string(operation.reason_code.as_deref()),
+            message: self.push_string(operation.message.as_deref()),
+        };
+    }
+
+    fn push_file_issue(&mut self, issue: &FileIssue) {
+        let ffi_issue = SmkFileIssue {
+            has_root_id: bool_byte(issue.root_id.is_some()),
+            root_id: self.push_string(issue.root_id.as_deref()),
+            path: self.push_path(&issue.path),
+            code: self.push_string(Some(issue.code.as_str())),
+            message: self.push_string(Some(issue.message.as_str())),
+            path_kind: self.push_string(issue.path_kind.as_deref()),
+            resolution_status: self.push_string(issue.resolution_status.as_deref()),
+            is_directory: bool_byte(issue.is_directory),
+        };
+        self.file_issues.push(ffi_issue);
+    }
+
     fn push_file_list(
         &mut self,
         snapshot: &FileListSnapshot,
-        root_indices: &BTreeMap<String, usize>,
+        root_indices: &BTreeMap<&str, usize>,
     ) {
         let first_child_index = self.file_entries.len();
         let child_count = snapshot
@@ -1171,15 +2736,23 @@ impl SmkScanResult {
             let ffi_entry = SmkFileEntry {
                 display_path: self.push_path(&entry.display_path),
                 resolved_path: self.push_path(&entry.resolved_path),
-                path_kind: self.push_string(Some(entry.path_kind.as_str())),
-                resolution_status: self.push_string(Some(entry.resolution_status.as_str())),
+                path_kind: static_slice(entry.path_kind.as_str()),
+                resolution_status: static_slice(entry.resolution_status.as_str()),
                 resolution_message: self.push_string(entry.resolution_message.as_deref()),
                 is_directory: bool_byte(entry.is_directory),
                 has_file_size: bool_byte(entry.file_size.is_some()),
                 file_size: entry.file_size.unwrap_or_default(),
                 has_content_modified_at: bool_byte(entry.content_modified_at.is_some()),
                 content_modified_at: entry.content_modified_at.unwrap_or_default(),
-                runtime_kind: self.push_string(entry.runtime_kind.map(script_runtime_kind)),
+                has_identity: bool_byte(entry.identity.is_some()),
+                identity: entry
+                    .identity
+                    .as_ref()
+                    .map(|identity| self.file_identity(identity))
+                    .unwrap_or_default(),
+                runtime_kind: entry.runtime_kind.map_or_else(SmkUtf8Slice::empty, |kind| {
+                    static_slice(script_runtime_kind(kind))
+                }),
                 shebang: self.push_string(entry.shebang.as_deref()),
                 has_scriptmeta: bool_byte(entry.has_scriptmeta),
                 has_scriptmeta_edit_password: bool_byte(entry.has_scriptmeta_edit_password),
@@ -1187,7 +2760,7 @@ impl SmkScanResult {
                 is_read_only: bool_byte(entry.is_read_only),
                 can_edit_scriptmeta: bool_byte(entry.can_edit_scriptmeta),
                 can_append_scriptmeta: bool_byte(entry.can_append_scriptmeta),
-                scriptmeta_edit_state: self.push_string(Some(entry.scriptmeta_edit_state.as_str())),
+                scriptmeta_edit_state: static_slice(entry.scriptmeta_edit_state.as_str()),
                 first_child_index: 0,
                 child_count: 0,
             };
@@ -1219,13 +2792,16 @@ impl SmkScanResult {
             root_id: self.push_string(Some(item.root_id.as_str())),
             file_path: self.push_path(&item.file_path),
             identity_path: self.push_path(&item.identity_path),
-            runtime_kind: self.push_string(item.runtime_kind.map(script_runtime_kind)),
+            runtime_kind: item.runtime_kind.map_or_else(SmkUtf8Slice::empty, |kind| {
+                static_slice(script_runtime_kind(kind))
+            }),
             shebang: self.push_string(item.shebang.as_deref()),
             script_id: self.push_string(Some(item.script_id.as_str())),
             version: self.push_string(item.version.as_deref()),
             name: self.push_string(item.name.as_deref()),
             description: self.push_string(item.description.as_deref()),
             target_app: self.push_string(item.target_app.as_deref()),
+            min_target_version: self.push_string(item.min_target_version.as_deref()),
             meta_url: self.push_url(item.meta_url.as_ref()),
             author: self.push_string(item.author.as_deref()),
             release_date: self.push_string(item.release_date.as_deref()),
@@ -1236,7 +2812,7 @@ impl SmkScanResult {
             is_read_only: bool_byte(item.is_read_only),
             can_edit_scriptmeta: bool_byte(item.can_edit_scriptmeta),
             can_append_scriptmeta: bool_byte(item.can_append_scriptmeta),
-            scriptmeta_edit_state: self.push_string(Some(item.scriptmeta_edit_state.as_str())),
+            scriptmeta_edit_state: static_slice(item.scriptmeta_edit_state.as_str()),
         }
     }
 
@@ -1256,18 +2832,28 @@ impl SmkScanResult {
     fn push_file_entry_change(&mut self, change: &FileEntryChange) {
         let entry = SmkFileEntryChange {
             root_id: self.push_string(Some(change.root_id.as_str())),
-            kind: self.push_string(Some(file_entry_change_kind(change.kind))),
+            kind: static_slice(file_entry_change_kind(change.kind)),
             display_path: self.push_path(&change.display_path),
             resolved_path: self.push_path(&change.resolved_path),
-            path_kind: self.push_string(Some(change.path_kind.as_str())),
-            resolution_status: self.push_string(Some(change.resolution_status.as_str())),
+            path_kind: static_slice(change.path_kind.as_str()),
+            resolution_status: static_slice(change.resolution_status.as_str()),
             resolution_message: self.push_string(change.resolution_message.as_deref()),
             is_directory: bool_byte(change.is_directory),
             has_file_size: bool_byte(change.file_size.is_some()),
             file_size: change.file_size.unwrap_or_default(),
             has_content_modified_at: bool_byte(change.content_modified_at.is_some()),
             content_modified_at: change.content_modified_at.unwrap_or_default(),
-            runtime_kind: self.push_string(change.runtime_kind.map(script_runtime_kind)),
+            has_identity: bool_byte(change.identity.is_some()),
+            identity: change
+                .identity
+                .as_ref()
+                .map(|identity| self.file_identity(identity))
+                .unwrap_or_default(),
+            runtime_kind: change
+                .runtime_kind
+                .map_or_else(SmkUtf8Slice::empty, |kind| {
+                    static_slice(script_runtime_kind(kind))
+                }),
             shebang: self.push_string(change.shebang.as_deref()),
             has_scriptmeta: bool_byte(change.has_scriptmeta),
             has_scriptmeta_edit_password: bool_byte(change.has_scriptmeta_edit_password),
@@ -1275,9 +2861,101 @@ impl SmkScanResult {
             is_read_only: bool_byte(change.is_read_only),
             can_edit_scriptmeta: bool_byte(change.can_edit_scriptmeta),
             can_append_scriptmeta: bool_byte(change.can_append_scriptmeta),
-            scriptmeta_edit_state: self.push_string(Some(change.scriptmeta_edit_state.as_str())),
+            scriptmeta_edit_state: static_slice(change.scriptmeta_edit_state.as_str()),
         };
         self.file_entry_changes.push(entry);
+    }
+
+    fn push_watch_change_batch(&mut self, batch: &RootChangeBatch) {
+        let rescan_target_count = batch
+            .affected_roots
+            .iter()
+            .map(|root| root.rescan_targets.len())
+            .sum();
+        self.watch_info = SmkWatchChangeInfo {
+            has_watch_change: 1,
+            overflowed: bool_byte(batch.overflowed),
+            path_count: batch.paths.len(),
+            affected_root_count: batch.affected_roots.len(),
+            event_count: batch.events.len(),
+            ignored_path_count: batch.ignored_paths.len(),
+            rename_candidate_count: batch.rename_candidates.len(),
+            rescan_target_count,
+        };
+        for event in &batch.events {
+            let event = self.watch_event(event);
+            self.watch_events.push(event);
+        }
+        for ignored in &batch.ignored_paths {
+            let ignored = self.ignored_watch_path(ignored);
+            self.ignored_watch_paths.push(ignored);
+        }
+        for candidate in &batch.rename_candidates {
+            let candidate = self.watch_rename_candidate(candidate);
+            self.watch_rename_candidates.push(candidate);
+        }
+        for target in batch
+            .affected_roots
+            .iter()
+            .flat_map(|root| root.rescan_targets.iter())
+        {
+            let target = self.watch_rescan_target(target);
+            self.watch_rescan_targets.push(target);
+        }
+    }
+
+    fn watch_event(&mut self, event: &WatchPathEvent) -> SmkWatchPathEvent {
+        SmkWatchPathEvent {
+            root_id: self.push_string(Some(event.root_id.as_str())),
+            path: self.push_path(&event.path),
+            kind: static_slice(watch_path_event_kind(event.kind)),
+            is_directory: bool_byte(event.is_directory),
+            rescan_directory: self.push_path(&event.rescan_directory),
+        }
+    }
+
+    fn ignored_watch_path(&mut self, ignored: &IgnoredWatchPath) -> SmkIgnoredWatchPath {
+        SmkIgnoredWatchPath {
+            has_root_id: bool_byte(ignored.root_id.is_some()),
+            root_id: self.push_string(ignored.root_id.as_deref()),
+            path: self.push_path(&ignored.path),
+            reason: static_slice(watch_ignore_reason(ignored.reason)),
+        }
+    }
+
+    fn watch_rename_candidate(
+        &mut self,
+        candidate: &WatchRenameCandidate,
+    ) -> SmkWatchRenameCandidate {
+        SmkWatchRenameCandidate {
+            root_id: self.push_string(Some(candidate.root_id.as_str())),
+            old_path: self.push_path(&candidate.old_path),
+            new_path: self.push_path(&candidate.new_path),
+            confidence: static_slice(watch_rename_confidence(candidate.confidence)),
+        }
+    }
+
+    fn watch_rescan_target(&mut self, target: &WatchRescanTarget) -> SmkWatchRescanTarget {
+        SmkWatchRescanTarget {
+            root_id: self.push_string(Some(target.root_id.as_str())),
+            path: self.push_path(&target.path),
+            reason: static_slice(watch_rescan_reason(target.reason)),
+        }
+    }
+
+    fn file_identity(&mut self, identity: &FileIdentity) -> SmkFileIdentity {
+        let (has_file_size, file_size) = optional_u64(identity.file_size);
+        let (has_content_modified_at, content_modified_at) =
+            optional_u64(identity.content_modified_at);
+        SmkFileIdentity {
+            stable_id: self.push_string(Some(identity.stable_id.as_str())),
+            volume_id: self.push_string(identity.volume_id.as_deref()),
+            file_id: self.push_string(identity.file_id.as_deref()),
+            has_file_size,
+            file_size,
+            has_content_modified_at,
+            content_modified_at,
+        }
     }
 
     fn push_update_result(&mut self, update_result: &UpdateCheckResult) {
@@ -1293,11 +2971,18 @@ impl SmkScanResult {
             .reserve(update_result.failures_by_item_id.len());
         self.update_errors
             .reserve(update_result.errors_by_item_id.len());
+        self.latest_url_history_urls.reserve(
+            update_result
+                .resolutions_by_item_id
+                .values()
+                .map(|resolution| resolution.latest_url_history.len())
+                .sum(),
+        );
 
         for (item_id, status) in &update_result.statuses_by_item_id {
             let entry = SmkUpdateStatusEntry {
                 item_id: self.push_string(Some(item_id.as_str())),
-                status: self.push_string(Some(update_status(*status))),
+                status: static_slice(update_status(*status)),
             };
             self.update_statuses.push(entry);
         }
@@ -1361,12 +3046,21 @@ impl SmkScanResult {
         let Some(value) = value.filter(|value| !value.is_empty()) else {
             return SmkUtf8Slice::empty();
         };
+        if let Some(slice) = self.string_index.get(value) {
+            return *slice;
+        }
         debug_assert!(
             self.string_storage.len().saturating_add(value.len()) <= self.string_storage.capacity()
         );
+        assert!(
+            self.string_storage.len().saturating_add(value.len()) <= self.string_storage.capacity(),
+            "SCRIPTMETAKit FFI string storage capacity was underestimated"
+        );
         let start = self.string_storage.len();
         self.string_storage.extend_from_slice(value.as_bytes());
-        borrowed_slice(&self.string_storage[start..])
+        let slice = borrowed_slice(&self.string_storage[start..]);
+        self.string_index.insert(value.to_string(), slice);
+        slice
     }
 
     fn push_path(&mut self, path: &Path) -> SmkUtf8Slice {
@@ -1377,15 +3071,213 @@ impl SmkScanResult {
     fn push_url(&mut self, url: Option<&Url>) -> SmkUtf8Slice {
         self.push_string(url.map(Url::as_str))
     }
+}
 
-    fn string(&self, slice: SmkUtf8Slice) -> String {
-        if slice.ptr.is_null() || slice.len == 0 {
-            return String::new();
+impl SmkEditResult {
+    fn empty(string_capacity: usize, generation_capacity: usize) -> Self {
+        Self {
+            string_storage: Vec::with_capacity(string_capacity),
+            text: SmkUtf8Slice::empty(),
+            file_write_result: SmkScriptMetadataFileWriteResult::default(),
+            edit_read_result: SmkScriptMetadataEditReadResult::default(),
+            edit_preview_result: SmkScriptMetadataEditPreviewResult::default(),
+            existing_lines: Vec::new(),
+            unknown_lines: Vec::new(),
+            has_backup_record: 0,
+            backup_record: SmkScriptMetaBackupRecord::default(),
+            backup_generations: Vec::with_capacity(generation_capacity),
         }
-        // SAFETY: the slice points into `self.string_storage`.
-        let bytes = unsafe { slice::from_raw_parts(slice.ptr, slice.len) };
-        String::from_utf8_lossy(bytes).into_owned()
     }
+
+    fn from_text(text: &str) -> Self {
+        let mut result = Self::empty(text.len(), 0);
+        result.text = result.push_string(Some(text));
+        result
+    }
+
+    fn from_file_write_result(value: &KitScriptMetadataFileWriteResult) -> Self {
+        let capacity = file_write_result_string_bytes(value);
+        let mut result = Self::empty(capacity, 0);
+        result.file_write_result = result.file_write_result(value);
+        result
+    }
+
+    fn from_edit_read_result(value: &KitScriptMetadataEditReadResult) -> Self {
+        let capacity = edit_read_result_string_bytes(value);
+        let mut result = Self::empty(capacity, 0);
+        result.edit_read_result = result.edit_read_result(value);
+        for line in &value.existing_lines {
+            let line = result.push_string(Some(line.as_str()));
+            result.existing_lines.push(line);
+        }
+        for line in &value.unknown_lines {
+            let line = result.push_string(Some(line.as_str()));
+            result.unknown_lines.push(line);
+        }
+        result
+    }
+
+    fn from_edit_preview_result(value: &KitScriptMetadataEditPreviewResult) -> Self {
+        let capacity = edit_preview_result_string_bytes(value);
+        let mut result = Self::empty(capacity, 0);
+        result.edit_preview_result = result.edit_preview_result(value);
+        result
+    }
+
+    fn from_backup_record(value: &KitScriptMetaBackupRecord) -> Self {
+        let capacity = backup_record_string_bytes(value);
+        let mut result = Self::empty(capacity, 0);
+        result.has_backup_record = 1;
+        result.backup_record = result.backup_record(value);
+        result
+    }
+
+    fn from_backup_generations(values: &[KitScriptMetaBackupGeneration]) -> Self {
+        let capacity = values
+            .iter()
+            .map(backup_generation_string_bytes)
+            .fold(0usize, usize::saturating_add);
+        let mut result = Self::empty(capacity, values.len());
+        for generation in values {
+            let generation = result.backup_generation(generation);
+            result.backup_generations.push(generation);
+        }
+        result
+    }
+
+    fn file_write_result(
+        &mut self,
+        value: &KitScriptMetadataFileWriteResult,
+    ) -> SmkScriptMetadataFileWriteResult {
+        let backup = value
+            .backup
+            .as_ref()
+            .map(|record| self.backup_record(record))
+            .unwrap_or_default();
+        SmkScriptMetadataFileWriteResult {
+            file_path: self.push_path(&value.file_path),
+            operation: static_slice(script_meta_write_operation(value.operation)),
+            has_backup: bool_byte(value.backup.is_some()),
+            backup,
+        }
+    }
+
+    fn edit_read_result(
+        &mut self,
+        value: &KitScriptMetadataEditReadResult,
+    ) -> SmkScriptMetadataEditReadResult {
+        SmkScriptMetadataEditReadResult {
+            file_path: self.push_path(&value.file_path),
+            draft: self.script_metadata_draft(&value.draft),
+            comment_style: static_slice(script_meta_comment_style(value.comment_style)),
+            line_ending: self.push_string(Some(value.line_ending.as_str())),
+            has_existing_block: bool_byte(value.has_existing_block),
+            existing_block_text: self.push_string(value.existing_block_text.as_deref()),
+            source_fingerprint: self.push_string(Some(value.source_fingerprint.as_str())),
+        }
+    }
+
+    fn edit_preview_result(
+        &mut self,
+        value: &KitScriptMetadataEditPreviewResult,
+    ) -> SmkScriptMetadataEditPreviewResult {
+        SmkScriptMetadataEditPreviewResult {
+            file_path: self.push_path(&value.file_path),
+            preview_text: self.push_string(Some(value.preview_text.as_str())),
+            preview_byte_count: value.preview_byte_count,
+            file_size: value.file_size.unwrap_or_default(),
+            has_file_size: bool_byte(value.file_size.is_some()),
+            comment_style: value
+                .comment_style
+                .map(|style| static_slice(script_meta_comment_style(style)))
+                .unwrap_or_else(SmkUtf8Slice::empty),
+            line_ending: self.push_string(Some(value.line_ending.as_str())),
+            has_scriptmeta_marker_in_preview: bool_byte(value.has_scriptmeta_marker_in_preview),
+            is_truncated: bool_byte(value.is_truncated),
+            requires_full_read: bool_byte(value.requires_full_read),
+            file_state_fingerprint: self.push_string(Some(value.file_state_fingerprint.as_str())),
+        }
+    }
+
+    fn script_metadata_draft(&mut self, draft: &KitScriptMetadataDraft) -> SmkScriptMetadataDraft {
+        SmkScriptMetadataDraft {
+            script_id: self.push_string(Some(draft.script_id.as_str())),
+            version: self.push_string(draft.version.as_deref()),
+            description: self.push_string(draft.description.as_deref()),
+            target_app: self.push_string(draft.target_app.as_deref()),
+            min_target_version: self.push_string(draft.min_target_version.as_deref()),
+            meta_url: self.push_string(draft.meta_url.as_ref().map(Url::as_str)),
+            name: self.push_string(draft.name.as_deref()),
+            author: self.push_string(draft.author.as_deref()),
+            release_date: self.push_string(draft.release_date.as_deref()),
+            edit_password_sha256: self.push_string(draft.edit_password_sha256.as_deref()),
+        }
+    }
+
+    fn backup_record(&mut self, value: &KitScriptMetaBackupRecord) -> SmkScriptMetaBackupRecord {
+        SmkScriptMetaBackupRecord {
+            id: self.push_string(Some(value.id.as_str())),
+            created_at_millis: value.created_at_millis,
+            backup_file_name: self.push_string(Some(value.backup_file_name.as_str())),
+            file_size: value.file_size,
+            reason: static_slice(script_meta_backup_reason_string(value.reason)),
+        }
+    }
+
+    fn backup_generation(
+        &mut self,
+        value: &KitScriptMetaBackupGeneration,
+    ) -> SmkScriptMetaBackupGeneration {
+        SmkScriptMetaBackupGeneration {
+            id: self.push_string(Some(value.id.as_str())),
+            sequence_number: value.sequence_number,
+            created_at_millis: value.created_at_millis,
+            file_path: self.push_path(&value.file_path),
+            file_size: value.file_size,
+            reason: static_slice(script_meta_backup_reason_string(value.reason)),
+            is_current_file: bool_byte(value.is_current_file),
+        }
+    }
+
+    fn push_string(&mut self, value: Option<&str>) -> SmkUtf8Slice {
+        let Some(value) = value.filter(|value| !value.is_empty()) else {
+            return SmkUtf8Slice::empty();
+        };
+        debug_assert!(
+            self.string_storage.len().saturating_add(value.len()) <= self.string_storage.capacity()
+        );
+        assert!(
+            self.string_storage.len().saturating_add(value.len()) <= self.string_storage.capacity(),
+            "SCRIPTMETAKit edit FFI string storage capacity was underestimated"
+        );
+        let start = self.string_storage.len();
+        self.string_storage.extend_from_slice(value.as_bytes());
+        borrowed_slice(&self.string_storage[start..])
+    }
+
+    fn push_path(&mut self, path: &Path) -> SmkUtf8Slice {
+        let value = path.to_string_lossy();
+        self.push_string(Some(value.as_ref()))
+    }
+}
+
+fn static_slice(value: &'static str) -> SmkUtf8Slice {
+    borrowed_slice(value.as_bytes())
+}
+
+fn total_file_entry_count(scan_result: &ScanResult) -> usize {
+    scan_result
+        .file_list_snapshots
+        .iter()
+        .map(|snapshot| snapshot.children.as_deref().map_or(0, file_entry_count))
+        .sum()
+}
+
+fn file_entry_count(entries: &[FileSystemEntry]) -> usize {
+    entries
+        .iter()
+        .map(|entry| 1usize.saturating_add(file_entry_count(&entry.children)))
+        .sum()
 }
 
 fn total_string_bytes(
@@ -1404,22 +3296,59 @@ fn total_string_bytes(
         .map(file_entry_string_bytes)
         .sum::<usize>();
     let item_bytes = scan_result.catalog_snapshot.as_ref().map_or(0, |snapshot| {
-        snapshot
+        let all_item_keys: BTreeSet<_> = snapshot
             .all_items
             .iter()
-            .chain(snapshot.file_items.iter())
-            .map(item_string_bytes)
-            .sum::<usize>()
+            .map(|item| std::sync::Arc::as_ptr(item) as usize)
+            .collect();
+        let all_item_bytes = snapshot
+            .all_items
+            .iter()
+            .map(|item| item_string_bytes(item))
+            .sum::<usize>();
+        let file_item_bytes = snapshot
+            .file_items
+            .iter()
+            .filter(|item| !all_item_keys.contains(&(std::sync::Arc::as_ptr(item) as usize)))
+            .map(|item| item_string_bytes(item))
+            .sum::<usize>();
+        all_item_bytes + file_item_bytes
     });
     let change_bytes = scan_result
         .change_summary
         .as_ref()
         .map_or(0, scan_change_summary_string_bytes);
+    let watch_bytes = scan_result
+        .watch_change_batch
+        .as_ref()
+        .map_or(0, watch_change_batch_string_bytes);
+    let operation_bytes = update_result
+        .map(|result| &result.operation)
+        .unwrap_or(&scan_result.operation)
+        .reason_code
+        .as_deref()
+        .map_or(0, str::len)
+        .saturating_add(
+            update_result
+                .map(|result| &result.operation)
+                .unwrap_or(&scan_result.operation)
+                .message
+                .as_deref()
+                .map_or(0, str::len),
+        );
+    let file_issue_bytes = scan_result
+        .file_issues
+        .iter()
+        .map(file_issue_string_bytes)
+        .sum::<usize>();
     let update_bytes = update_result.map_or(0, update_result_string_bytes);
     root_bytes
         .saturating_add(file_list_bytes)
         .saturating_add(item_bytes)
         .saturating_add(change_bytes)
+        .saturating_add(operation_bytes)
+        .saturating_add(file_issue_bytes)
+        .saturating_add(watch_bytes)
         .saturating_add(update_bytes)
 }
 
@@ -1427,7 +3356,6 @@ fn root_string_bytes(root: &RootSnapshot) -> usize {
     root.root_id
         .len()
         .saturating_add(root.path.to_string_lossy().len())
-        .saturating_add(root_status(root.status).len())
         .saturating_add(root.error.as_ref().map_or(0, |error| {
             error.code.len().saturating_add(error.message.len())
         }))
@@ -1439,16 +3367,14 @@ fn file_entry_string_bytes(entry: &FileSystemEntry) -> usize {
         .to_string_lossy()
         .len()
         .saturating_add(entry.resolved_path.to_string_lossy().len())
-        .saturating_add(entry.path_kind.as_str().len())
-        .saturating_add(entry.resolution_status.as_str().len())
         .saturating_add(entry.resolution_message.as_deref().map_or(0, str::len))
+        .saturating_add(entry.shebang.as_deref().map_or(0, str::len))
         .saturating_add(
             entry
-                .runtime_kind
-                .map_or(0, |kind| script_runtime_kind(kind).len()),
+                .identity
+                .as_ref()
+                .map_or(0, file_identity_string_bytes),
         )
-        .saturating_add(entry.shebang.as_deref().map_or(0, str::len))
-        .saturating_add(entry.scriptmeta_edit_state.as_str().len())
         .saturating_add(
             entry
                 .children
@@ -1463,19 +3389,17 @@ fn item_string_bytes(item: &ScriptMetaItem) -> usize {
         item.root_id.len(),
         item.file_path.to_string_lossy().len(),
         item.identity_path.to_string_lossy().len(),
-        item.runtime_kind
-            .map_or(0, |kind| script_runtime_kind(kind).len()),
         item.shebang.as_deref().map_or(0, str::len),
         item.script_id.len(),
         item.version.as_deref().map_or(0, str::len),
         item.name.as_deref().map_or(0, str::len),
         item.description.as_deref().map_or(0, str::len),
         item.target_app.as_deref().map_or(0, str::len),
+        item.min_target_version.as_deref().map_or(0, str::len),
         item.meta_url.as_ref().map_or(0, |url| url.as_str().len()),
         item.author.as_deref().map_or(0, str::len),
         item.release_date.as_deref().map_or(0, str::len),
         item.edit_password_sha256.as_deref().map_or(0, str::len),
-        item.scriptmeta_edit_state.as_str().len(),
     ]
     .into_iter()
     .fold(0usize, usize::saturating_add)
@@ -1493,26 +3417,103 @@ fn file_entry_change_string_bytes(change: &FileEntryChange) -> usize {
     change
         .root_id
         .len()
-        .saturating_add(file_entry_change_kind(change.kind).len())
         .saturating_add(change.display_path.to_string_lossy().len())
         .saturating_add(change.resolved_path.to_string_lossy().len())
-        .saturating_add(change.path_kind.as_str().len())
-        .saturating_add(change.resolution_status.as_str().len())
         .saturating_add(change.resolution_message.as_deref().map_or(0, str::len))
+        .saturating_add(change.shebang.as_deref().map_or(0, str::len))
         .saturating_add(
             change
-                .runtime_kind
-                .map_or(0, |kind| script_runtime_kind(kind).len()),
+                .identity
+                .as_ref()
+                .map_or(0, file_identity_string_bytes),
         )
-        .saturating_add(change.shebang.as_deref().map_or(0, str::len))
-        .saturating_add(change.scriptmeta_edit_state.as_str().len())
+}
+
+fn file_identity_string_bytes(identity: &FileIdentity) -> usize {
+    identity
+        .stable_id
+        .len()
+        .saturating_add(identity.volume_id.as_deref().map_or(0, str::len))
+        .saturating_add(identity.file_id.as_deref().map_or(0, str::len))
+}
+
+fn file_issue_string_bytes(issue: &FileIssue) -> usize {
+    issue
+        .root_id
+        .as_deref()
+        .map_or(0, str::len)
+        .saturating_add(issue.path.to_string_lossy().len())
+        .saturating_add(issue.code.len())
+        .saturating_add(issue.message.len())
+        .saturating_add(issue.path_kind.as_deref().map_or(0, str::len))
+        .saturating_add(issue.resolution_status.as_deref().map_or(0, str::len))
+}
+
+fn watch_change_batch_string_bytes(batch: &RootChangeBatch) -> usize {
+    batch
+        .events
+        .iter()
+        .map(watch_event_string_bytes)
+        .sum::<usize>()
+        .saturating_add(
+            batch
+                .ignored_paths
+                .iter()
+                .map(ignored_watch_path_string_bytes)
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            batch
+                .rename_candidates
+                .iter()
+                .map(watch_rename_candidate_string_bytes)
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            batch
+                .affected_roots
+                .iter()
+                .flat_map(|root| root.rescan_targets.iter())
+                .map(watch_rescan_target_string_bytes)
+                .sum::<usize>(),
+        )
+}
+
+fn watch_event_string_bytes(event: &WatchPathEvent) -> usize {
+    event
+        .root_id
+        .len()
+        .saturating_add(event.path.to_string_lossy().len())
+        .saturating_add(event.rescan_directory.to_string_lossy().len())
+}
+
+fn ignored_watch_path_string_bytes(path: &IgnoredWatchPath) -> usize {
+    path.root_id
+        .as_deref()
+        .map_or(0, str::len)
+        .saturating_add(path.path.to_string_lossy().len())
+}
+
+fn watch_rename_candidate_string_bytes(candidate: &WatchRenameCandidate) -> usize {
+    candidate
+        .root_id
+        .len()
+        .saturating_add(candidate.old_path.to_string_lossy().len())
+        .saturating_add(candidate.new_path.to_string_lossy().len())
+}
+
+fn watch_rescan_target_string_bytes(target: &WatchRescanTarget) -> usize {
+    target
+        .root_id
+        .len()
+        .saturating_add(target.path.to_string_lossy().len())
 }
 
 fn update_result_string_bytes(update_result: &UpdateCheckResult) -> usize {
     let statuses = update_result
         .statuses_by_item_id
-        .iter()
-        .map(|(item_id, status)| item_id.len().saturating_add(update_status(*status).len()))
+        .keys()
+        .map(String::len)
         .sum::<usize>();
     let resolutions = update_result
         .resolutions_by_item_id
@@ -1572,6 +3573,63 @@ fn update_result_string_bytes(update_result: &UpdateCheckResult) -> usize {
         .saturating_add(resolutions)
         .saturating_add(failures)
         .saturating_add(errors)
+}
+
+fn file_write_result_string_bytes(value: &KitScriptMetadataFileWriteResult) -> usize {
+    value
+        .file_path
+        .to_string_lossy()
+        .len()
+        .saturating_add(value.backup.as_ref().map_or(0, backup_record_string_bytes))
+}
+
+fn edit_read_result_string_bytes(value: &KitScriptMetadataEditReadResult) -> usize {
+    value
+        .file_path
+        .to_string_lossy()
+        .len()
+        .saturating_add(script_metadata_draft_string_bytes(&value.draft))
+        .saturating_add(value.line_ending.len())
+        .saturating_add(value.existing_block_text.as_deref().map_or(0, str::len))
+        .saturating_add(value.source_fingerprint.len())
+        .saturating_add(value.existing_lines.iter().map(String::len).sum::<usize>())
+        .saturating_add(value.unknown_lines.iter().map(String::len).sum::<usize>())
+}
+
+fn edit_preview_result_string_bytes(value: &KitScriptMetadataEditPreviewResult) -> usize {
+    value
+        .file_path
+        .to_string_lossy()
+        .len()
+        .saturating_add(value.preview_text.len())
+        .saturating_add(value.line_ending.len())
+        .saturating_add(value.file_state_fingerprint.len())
+}
+
+fn script_metadata_draft_string_bytes(draft: &KitScriptMetadataDraft) -> usize {
+    draft
+        .script_id
+        .len()
+        .saturating_add(draft.version.as_deref().map_or(0, str::len))
+        .saturating_add(draft.description.as_deref().map_or(0, str::len))
+        .saturating_add(draft.target_app.as_deref().map_or(0, str::len))
+        .saturating_add(draft.min_target_version.as_deref().map_or(0, str::len))
+        .saturating_add(draft.meta_url.as_ref().map_or(0, |url| url.as_str().len()))
+        .saturating_add(draft.name.as_deref().map_or(0, str::len))
+        .saturating_add(draft.author.as_deref().map_or(0, str::len))
+        .saturating_add(draft.release_date.as_deref().map_or(0, str::len))
+        .saturating_add(draft.edit_password_sha256.as_deref().map_or(0, str::len))
+}
+
+fn backup_record_string_bytes(value: &KitScriptMetaBackupRecord) -> usize {
+    value.id.len().saturating_add(value.backup_file_name.len())
+}
+
+fn backup_generation_string_bytes(value: &KitScriptMetaBackupGeneration) -> usize {
+    value
+        .id
+        .len()
+        .saturating_add(value.file_path.to_string_lossy().len())
 }
 
 impl SmkEngine {
@@ -1636,6 +3694,27 @@ fn scan_result_ref<'a>(
     Ok(unsafe { &*result })
 }
 
+fn edit_result_ref<'a>(
+    result: *const SmkEditResult,
+) -> Result<&'a SmkEditResult, (SmkStatus, String)> {
+    if result.is_null() {
+        return Err((
+            SmkStatus::NullArgument,
+            "edit result handle is null".to_string(),
+        ));
+    }
+    // SAFETY: the caller must pass a live `SmkEditResult` returned by this crate.
+    Ok(unsafe { &*result })
+}
+
+fn input_ref<'a, T>(ptr: *const T, name: &str) -> Result<&'a T, (SmkStatus, String)> {
+    if ptr.is_null() {
+        return Err((SmkStatus::NullArgument, format!("{name} is null")));
+    }
+    // SAFETY: the caller promises `ptr` points to a readable value for this call.
+    Ok(unsafe { &*ptr })
+}
+
 fn utf8_path_slices(
     ptr: *const SmkUtf8Slice,
     len: usize,
@@ -1656,6 +3735,321 @@ fn utf8_path_slices(
         }
     }
     Ok(paths)
+}
+
+fn root_registrations_from_raw(
+    ptr: *const SmkRootRegistration,
+    len: usize,
+) -> Result<Vec<RootRegistration>, (SmkStatus, String)> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if ptr.is_null() {
+        return Err((
+            SmkStatus::NullArgument,
+            "root registration slice is null".to_string(),
+        ));
+    }
+    // SAFETY: the caller promises `ptr` points to `len` readable root registrations.
+    let roots = unsafe { slice::from_raw_parts(ptr, len) };
+    roots
+        .iter()
+        .map(root_registration_from_ffi)
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn root_ids_from_raw(
+    ptr: *const SmkUtf8Slice,
+    len: usize,
+) -> Result<Vec<String>, (SmkStatus, String)> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if ptr.is_null() {
+        return Err((SmkStatus::NullArgument, "root id slice is null".to_string()));
+    }
+    // SAFETY: the caller promises `ptr` points to `len` readable root id slices.
+    let root_ids = unsafe { slice::from_raw_parts(ptr, len) };
+    root_ids
+        .iter()
+        .map(|root_id| required_str_from_slice(*root_id, "root_id").map(ToOwned::to_owned))
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn root_registration_from_ffi(
+    root: &SmkRootRegistration,
+) -> Result<RootRegistration, (SmkStatus, String)> {
+    Ok(RootRegistration {
+        root_id: required_str_from_slice(root.root_id, "root_id")?.to_string(),
+        path: required_path_from_slice(root.path, "root path")?,
+        display_name: optional_string_from_slice(root.display_name)?,
+        purpose: root_purpose_from_u32(root.purpose)?,
+        watch_policy: watch_policy_from_u32(root.watch_policy)?,
+        cache_policy: cache_policy_from_u32(root.cache_policy)?,
+        refresh_policy: refresh_policy_from_u32(root.refresh_policy)?,
+        priority: root_priority_from_u32(root.priority)?,
+    })
+}
+
+fn path_from_slice(value: SmkUtf8Slice) -> Result<PathBuf, (SmkStatus, String)> {
+    required_path_from_slice(value, "file path")
+}
+
+fn required_path_from_slice(
+    value: SmkUtf8Slice,
+    name: &str,
+) -> Result<PathBuf, (SmkStatus, String)> {
+    let value = required_str_from_slice(value, name)?;
+    Ok(PathBuf::from(value))
+}
+
+fn optional_path_from_slice(value: SmkUtf8Slice) -> Result<Option<PathBuf>, (SmkStatus, String)> {
+    optional_str_from_slice(value).map(|value| value.map(PathBuf::from))
+}
+
+fn backup_options_from_slice(
+    value: SmkUtf8Slice,
+) -> Result<ScriptMetaBackupOptions, (SmkStatus, String)> {
+    let root_directory = required_path_from_slice(value, "backup root path")?;
+    Ok(ScriptMetaBackupOptions { root_directory })
+}
+
+fn required_str_from_slice<'a>(
+    value: SmkUtf8Slice,
+    name: &str,
+) -> Result<&'a str, (SmkStatus, String)> {
+    let value = utf8_from_raw(value.ptr, value.len)?;
+    if value.is_empty() {
+        return Err((SmkStatus::InvalidArgument, format!("{name} is empty")));
+    }
+    Ok(value)
+}
+
+fn optional_str_from_slice<'a>(
+    value: SmkUtf8Slice,
+) -> Result<Option<&'a str>, (SmkStatus, String)> {
+    let value = utf8_from_raw(value.ptr, value.len)?;
+    Ok((!value.is_empty()).then_some(value))
+}
+
+fn optional_string_from_slice(value: SmkUtf8Slice) -> Result<Option<String>, (SmkStatus, String)> {
+    optional_str_from_slice(value).map(|value| value.map(ToOwned::to_owned))
+}
+
+fn optional_version_from_slice(
+    value: SmkUtf8Slice,
+    field_name: &str,
+) -> Result<Option<String>, (SmkStatus, String)> {
+    let Some(value) = optional_str_from_slice(value)? else {
+        return Ok(None);
+    };
+    normalize_version_string(value).map(Some).ok_or_else(|| {
+        (
+            SmkStatus::InvalidArgument,
+            format!("{field_name}: invalid version"),
+        )
+    })
+}
+
+fn optional_url_from_slice(
+    value: SmkUtf8Slice,
+    field_name: &str,
+) -> Result<Option<Url>, (SmkStatus, String)> {
+    let Some(value) = optional_str_from_slice(value)? else {
+        return Ok(None);
+    };
+    normalize_metadata_url(value).map(Some).ok_or_else(|| {
+        (
+            SmkStatus::InvalidArgument,
+            format!("{field_name}: invalid URL"),
+        )
+    })
+}
+
+fn script_item_from_ffi(item: &SmkScriptItem) -> Result<ScriptMetaItem, (SmkStatus, String)> {
+    let file_path = required_path_from_slice(item.file_path, "file_path")?;
+    let identity_path =
+        optional_path_from_slice(item.identity_path)?.unwrap_or_else(|| file_path.clone());
+    Ok(ScriptMetaItem {
+        root_id: required_str_from_slice(item.root_id, "root_id")?.to_string(),
+        file_path,
+        identity_path,
+        runtime_kind: optional_script_runtime_kind_from_slice(item.runtime_kind)?,
+        shebang: optional_string_from_slice(item.shebang)?,
+        script_id: required_str_from_slice(item.script_id, "Script-ID")?.to_string(),
+        version: optional_version_from_slice(item.version, "Version")?,
+        description: optional_string_from_slice(item.description)?,
+        target_app: optional_string_from_slice(item.target_app)?,
+        min_target_version: optional_version_from_slice(
+            item.min_target_version,
+            "Min-Target-Version",
+        )?,
+        meta_url: optional_url_from_slice(item.meta_url, "Meta-URL")?,
+        name: optional_string_from_slice(item.name)?,
+        author: optional_string_from_slice(item.author)?,
+        release_date: optional_string_from_slice(item.release_date)?,
+        edit_password_sha256: optional_string_from_slice(item.edit_password_sha256)?,
+        has_scriptmeta: item.has_scriptmeta != 0,
+        has_scriptmeta_edit_password: item.has_scriptmeta_edit_password != 0,
+        is_file_locked: item.is_file_locked != 0,
+        is_read_only: item.is_read_only != 0,
+        can_edit_scriptmeta: item.can_edit_scriptmeta != 0,
+        can_append_scriptmeta: item.can_append_scriptmeta != 0,
+        scriptmeta_edit_state: script_meta_edit_state_from_slice(item.scriptmeta_edit_state)?,
+    })
+}
+
+fn script_metadata_draft_from_ffi(
+    draft: &SmkScriptMetadataDraft,
+) -> Result<KitScriptMetadataDraft, (SmkStatus, String)> {
+    Ok(KitScriptMetadataDraft {
+        script_id: required_str_from_slice(draft.script_id, "Script-ID")?.to_string(),
+        version: optional_version_from_slice(draft.version, "Version")?,
+        description: optional_string_from_slice(draft.description)?,
+        target_app: optional_string_from_slice(draft.target_app)?,
+        min_target_version: optional_version_from_slice(
+            draft.min_target_version,
+            "Min-Target-Version",
+        )?,
+        meta_url: optional_url_from_slice(draft.meta_url, "Meta-URL")?,
+        name: optional_string_from_slice(draft.name)?,
+        author: optional_string_from_slice(draft.author)?,
+        release_date: optional_string_from_slice(draft.release_date)?,
+        edit_password_sha256: optional_string_from_slice(draft.edit_password_sha256)?,
+    })
+}
+
+fn distribution_metadata_draft_from_ffi(
+    draft: &SmkDistributionMetadataDraft,
+) -> Result<KitDistributionMetadataDraft, (SmkStatus, String)> {
+    Ok(KitDistributionMetadataDraft {
+        script_id: required_str_from_slice(draft.script_id, "Script-ID")?.to_string(),
+        version: optional_version_from_slice(draft.version, "Version")?,
+        latest_url: optional_url_from_slice(draft.latest_url, "Latest-URL")?,
+        latest_page_url: optional_url_from_slice(draft.latest_page_url, "Latest-Page-URL")?,
+    })
+}
+
+fn distribution_metadata_drafts_from_raw(
+    ptr: *const SmkDistributionMetadataDraft,
+    len: usize,
+) -> Result<Vec<KitDistributionMetadataDraft>, (SmkStatus, String)> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if ptr.is_null() {
+        return Err((
+            SmkStatus::NullArgument,
+            "distribution metadata records are null".to_string(),
+        ));
+    }
+    // SAFETY: the caller promises `ptr` points to `len` readable records.
+    let drafts = unsafe { slice::from_raw_parts(ptr, len) };
+    drafts
+        .iter()
+        .map(distribution_metadata_draft_from_ffi)
+        .collect()
+}
+
+fn script_meta_write_mode(value: u32) -> Result<ScriptMetaWriteMode, (SmkStatus, String)> {
+    match value {
+        0 => Ok(ScriptMetaWriteMode::InsertOrReplace),
+        1 => Ok(ScriptMetaWriteMode::InsertOnly),
+        2 => Ok(ScriptMetaWriteMode::ReplaceOnly),
+        _ => Err((
+            SmkStatus::InvalidArgument,
+            format!("unknown script metadata write mode `{value}`"),
+        )),
+    }
+}
+
+fn script_meta_backup_reason(value: u32) -> Result<ScriptMetaBackupReason, (SmkStatus, String)> {
+    match value {
+        0 => Ok(ScriptMetaBackupReason::BeforeSave),
+        1 => Ok(ScriptMetaBackupReason::BeforeRestore),
+        2 => Ok(ScriptMetaBackupReason::ResetInitial),
+        _ => Err((
+            SmkStatus::InvalidArgument,
+            format!("unknown script metadata backup reason `{value}`"),
+        )),
+    }
+}
+
+fn scan_mode_from_u32(value: u32) -> Result<ScanMode, (SmkStatus, String)> {
+    match value {
+        0 => Ok(ScanMode::FileListOnly),
+        1 => Ok(ScanMode::MetadataOnly),
+        2 => Ok(ScanMode::FileListAndMetadata),
+        _ => Err((
+            SmkStatus::InvalidArgument,
+            format!("unknown scan mode `{value}`"),
+        )),
+    }
+}
+
+fn root_purpose_from_u32(value: u32) -> Result<RootPurpose, (SmkStatus, String)> {
+    match value {
+        0 => Ok(RootPurpose::FileList),
+        1 => Ok(RootPurpose::MetadataCatalog),
+        2 => Ok(RootPurpose::UpdateCheck),
+        3 => Ok(RootPurpose::FileListAndMetadata),
+        _ => Err((
+            SmkStatus::InvalidArgument,
+            format!("unknown root purpose `{value}`"),
+        )),
+    }
+}
+
+fn watch_policy_from_u32(value: u32) -> Result<WatchPolicy, (SmkStatus, String)> {
+    match value {
+        0 => Ok(WatchPolicy::Disabled),
+        1 => Ok(WatchPolicy::VisibleOnly),
+        2 => Ok(WatchPolicy::AllRegistered),
+        3 => Ok(WatchPolicy::Manual),
+        _ => Err((
+            SmkStatus::InvalidArgument,
+            format!("unknown watch policy `{value}`"),
+        )),
+    }
+}
+
+fn cache_policy_from_u32(value: u32) -> Result<CachePolicy, (SmkStatus, String)> {
+    match value {
+        0 => Ok(CachePolicy::Disabled),
+        1 => Ok(CachePolicy::MemoryOnly),
+        2 => Ok(CachePolicy::PersistentCatalogOnly),
+        3 => Ok(CachePolicy::MemoryAndPersistent),
+        _ => Err((
+            SmkStatus::InvalidArgument,
+            format!("unknown cache policy `{value}`"),
+        )),
+    }
+}
+
+fn refresh_policy_from_u32(value: u32) -> Result<RefreshPolicy, (SmkStatus, String)> {
+    match value {
+        0 => Ok(RefreshPolicy::ManualOnly),
+        1 => Ok(RefreshPolicy::OnVisible),
+        2 => Ok(RefreshPolicy::OnFileEvent),
+        3 => Ok(RefreshPolicy::OnFileEventDeferred),
+        4 => Ok(RefreshPolicy::Scheduled),
+        _ => Err((
+            SmkStatus::InvalidArgument,
+            format!("unknown refresh policy `{value}`"),
+        )),
+    }
+}
+
+fn root_priority_from_u32(value: u32) -> Result<RootPriority, (SmkStatus, String)> {
+    match value {
+        0 => Ok(RootPriority::VisibleWhenSelected),
+        1 => Ok(RootPriority::UserInitiated),
+        2 => Ok(RootPriority::Background),
+        _ => Err((
+            SmkStatus::InvalidArgument,
+            format!("unknown root priority `{value}`"),
+        )),
+    }
 }
 
 fn utf8_from_raw<'a>(ptr: *const u8, len: usize) -> Result<&'a str, (SmkStatus, String)> {
@@ -1738,7 +4132,12 @@ fn root_status(status: RootStatus) -> &'static str {
         RootStatus::Unreadable => "unreadable",
         RootStatus::TimedOut => "timed_out",
         RootStatus::Overflowed => "overflowed",
+        RootStatus::Cancelled => "cancelled",
     }
+}
+
+fn operation_status(status: scriptmetakit::OperationStatus) -> &'static str {
+    status.as_str()
 }
 
 fn script_runtime_kind(kind: ScriptRuntimeKind) -> &'static str {
@@ -1750,11 +4149,86 @@ fn script_runtime_kind(kind: ScriptRuntimeKind) -> &'static str {
     }
 }
 
+fn optional_script_runtime_kind_from_slice(
+    value: SmkUtf8Slice,
+) -> Result<Option<ScriptRuntimeKind>, (SmkStatus, String)> {
+    let Some(value) = optional_str_from_slice(value)? else {
+        return Ok(None);
+    };
+    match value {
+        "apple_script" => Ok(Some(ScriptRuntimeKind::AppleScript)),
+        "javascript_for_automation" => Ok(Some(ScriptRuntimeKind::JavaScriptForAutomation)),
+        "adobe_java_script" => Ok(Some(ScriptRuntimeKind::AdobeJavaScript)),
+        "adobe_uxp" => Ok(Some(ScriptRuntimeKind::AdobeUxp)),
+        _ => Err((
+            SmkStatus::InvalidArgument,
+            format!("unknown runtime_kind `{value}`"),
+        )),
+    }
+}
+
+fn script_meta_edit_state_from_slice(
+    value: SmkUtf8Slice,
+) -> Result<ScriptMetaEditState, (SmkStatus, String)> {
+    let Some(value) = optional_str_from_slice(value)? else {
+        return Ok(ScriptMetaEditState::Unknown);
+    };
+    match value {
+        "unknown" => Ok(ScriptMetaEditState::Unknown),
+        "unsupported" => Ok(ScriptMetaEditState::Unsupported),
+        "obfuscated" => Ok(ScriptMetaEditState::Obfuscated),
+        "read_only" => Ok(ScriptMetaEditState::ReadOnly),
+        "appendable" => Ok(ScriptMetaEditState::Appendable),
+        "editable" => Ok(ScriptMetaEditState::Editable),
+        _ => Err((
+            SmkStatus::InvalidArgument,
+            format!("unknown scriptmeta_edit_state `{value}`"),
+        )),
+    }
+}
+
 fn file_entry_change_kind(kind: FileEntryChangeKind) -> &'static str {
     match kind {
         FileEntryChangeKind::Added => "added",
         FileEntryChangeKind::Removed => "removed",
         FileEntryChangeKind::Modified => "modified",
+    }
+}
+
+fn watch_path_event_kind(kind: WatchPathEventKind) -> &'static str {
+    match kind {
+        WatchPathEventKind::Added => "added",
+        WatchPathEventKind::Modified => "modified",
+        WatchPathEventKind::Removed => "removed",
+        WatchPathEventKind::DirectoryChanged => "directory_changed",
+        WatchPathEventKind::RootChanged => "root_changed",
+        WatchPathEventKind::Overflow => "overflow",
+    }
+}
+
+fn watch_ignore_reason(reason: WatchIgnoreReason) -> &'static str {
+    match reason {
+        WatchIgnoreReason::OutsideRoot => "outside_root",
+        WatchIgnoreReason::HiddenPath => "hidden_path",
+        WatchIgnoreReason::PackagePath => "package_path",
+        WatchIgnoreReason::UnsupportedExtension => "unsupported_extension",
+        WatchIgnoreReason::NotRelevant => "not_relevant",
+    }
+}
+
+fn watch_rename_confidence(confidence: WatchRenameConfidence) -> &'static str {
+    match confidence {
+        WatchRenameConfidence::Possible => "possible",
+    }
+}
+
+fn watch_rescan_reason(reason: WatchRescanReason) -> &'static str {
+    match reason {
+        WatchRescanReason::ChangedPath => "changed_path",
+        WatchRescanReason::DirectoryChanged => "directory_changed",
+        WatchRescanReason::RootChanged => "root_changed",
+        WatchRescanReason::Overflow => "overflow",
+        WatchRescanReason::TooManyDirtyDirectories => "too_many_dirty_directories",
     }
 }
 
@@ -1766,6 +4240,7 @@ fn update_status(status: UpdateStatus) -> &'static str {
         UpdateStatus::UpdateAvailable => "update_available",
         UpdateStatus::Failed => "failed",
         UpdateStatus::NotCheckable => "not_checkable",
+        UpdateStatus::Cancelled => "cancelled",
     }
 }
 
@@ -1776,6 +4251,30 @@ fn update_progress_phase(phase: UpdateCheckProgressPhase) -> &'static str {
         UpdateCheckProgressPhase::Retrying => "retrying",
         UpdateCheckProgressPhase::FinishedItem => "finished_item",
         UpdateCheckProgressPhase::FailedItem => "failed_item",
+        UpdateCheckProgressPhase::Cancelled => "cancelled",
         UpdateCheckProgressPhase::Finished => "finished",
+    }
+}
+
+fn script_meta_write_operation(operation: ScriptMetaWriteOperation) -> &'static str {
+    match operation {
+        ScriptMetaWriteOperation::Inserted => "inserted",
+        ScriptMetaWriteOperation::Replaced => "replaced",
+    }
+}
+
+fn script_meta_comment_style(style: scriptmetakit::ScriptMetaCommentStyle) -> &'static str {
+    match style {
+        scriptmetakit::ScriptMetaCommentStyle::JavaScriptBlock => "javascript_block",
+        scriptmetakit::ScriptMetaCommentStyle::AppleScriptBlock => "apple_script_block",
+        scriptmetakit::ScriptMetaCommentStyle::PlainText => "plain_text",
+    }
+}
+
+fn script_meta_backup_reason_string(reason: ScriptMetaBackupReason) -> &'static str {
+    match reason {
+        ScriptMetaBackupReason::BeforeSave => "before_save",
+        ScriptMetaBackupReason::BeforeRestore => "before_restore",
+        ScriptMetaBackupReason::ResetInitial => "reset_initial",
     }
 }

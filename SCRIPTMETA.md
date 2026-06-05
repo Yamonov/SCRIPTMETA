@@ -107,6 +107,8 @@ SCRIPTMETA-DIST-END
 
 `Latest-URL` は、次に参照すべき SCRIPTMETA 情報ページの URL です。配布ファイルそのものの URL ではありません。
 
+配布ページ側では、更新確認に使う `Script-ID`、`Version`、`Latest-URL`、`Latest-Page-URL` だけを記述対象にします。`Name`、`Author`、`Description`、`Target-App`、`Min-Target-Version`、`Release-Date`、`Edit-Password-SHA256` は配布ページ側では解釈しません。
+
 最新版ページの例:
 
 ```text
@@ -463,9 +465,9 @@ SCRIPTMETA は次のルールで記述します。
 | Meta-URL | 必須 | 書かない | - | 最初に参照する SCRIPTMETA 情報ページ |
 | Latest-URL | - | - | 旧版ページで必須 | 次に参照する SCRIPTMETA 情報ページ |
 | Description | 推奨 | 推奨 | 無視 | スクリプト説明文 |
-| Target-App | 推奨 | 推奨 | 任意 | 対象アプリ |
-| Min-Target-Version | 任意 | 任意 | 任意 | 動作対象バージョン |
-| Release-Date | 任意 | 任意 | 任意 | リリース日 |
+| Target-App | 推奨 | 推奨 | 無視 | 対象アプリ |
+| Min-Target-Version | 任意 | - | 無視 | 動作対象バージョン |
+| Release-Date | 任意 | 任意 | 無視 | リリース日 |
 | Name | 任意 | 任意 | 無視 | 表示名。識別には使わない |
 | Author | 推奨。パスワードありで必須 | 任意。パスワードありで必須 | 無視 | 作者名。識別には使わない |
 | Edit-Password-SHA256 | 任意 | 任意 | 無視 | 編集UI用のパスワードハッシュ。更新確認には使わない |

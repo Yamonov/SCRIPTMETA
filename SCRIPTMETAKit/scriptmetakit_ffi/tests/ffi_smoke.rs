@@ -7,16 +7,28 @@ use std::{
 };
 
 use scriptmetakit_ffi::{
-    SmkDistributionResolutionEntrySlice, SmkEngine, SmkFileEntryChangeSlice, SmkFileEntrySlice,
-    SmkFileListSnapshotSlice, SmkRootSnapshotSlice, SmkScanChangeInfo, SmkScanResult,
-    SmkScriptItemSlice, SmkStatus, SmkUpdateCheckInfo, SmkUpdateProgress,
-    SmkUpdateStatusEntrySlice, SmkUtf8Slice, smk_engine_create_default, smk_engine_free,
-    smk_engine_last_error, smk_engine_scan_folder, smk_engine_scan_folders,
-    smk_engine_scan_folders_with_progress, smk_engine_set_resolve_macos_alias,
-    smk_scan_result_change_info, smk_scan_result_file_entries, smk_scan_result_file_entry_changes,
+    SmkDistributionMetadataDraft, SmkDistributionResolutionEntrySlice, SmkEditResult, SmkEngine,
+    SmkFileEntryChangeSlice, SmkFileEntrySlice, SmkFileIssueSlice, SmkFileListSnapshotSlice,
+    SmkOperationInfo, SmkRootRegistration, SmkRootSnapshotSlice, SmkScanChangeInfo, SmkScanResult,
+    SmkScriptItemSlice, SmkScriptMetaBackupGenerationSlice, SmkScriptMetaBackupRecord,
+    SmkScriptMetadataDraft, SmkScriptMetadataEditPreviewResult, SmkScriptMetadataFileWriteResult,
+    SmkScriptMetadataWriteRequest, SmkStatus, SmkUpdateCheckInfo, SmkUpdateProgress,
+    SmkUpdateStatusEntrySlice, SmkUtf8Slice, smk_edit_result_backup_generations,
+    smk_edit_result_backup_record, smk_edit_result_file_write_result, smk_edit_result_free,
+    smk_edit_result_metadata_edit_preview_result, smk_edit_result_text,
+    smk_engine_cancel_current_operation, smk_engine_check_update_item, smk_engine_create_default,
+    smk_engine_free, smk_engine_generate_edit_password_sha256, smk_engine_last_error,
+    smk_engine_read_script_metadata_edit_preview_file, smk_engine_render_distribution_metadata,
+    smk_engine_restore_scriptmeta_backup, smk_engine_scan_folder, smk_engine_scan_folders,
+    smk_engine_scan_folders_with_progress, smk_engine_scan_registered_roots, smk_engine_scan_roots,
+    smk_engine_scriptmeta_backup_generations, smk_engine_set_resolve_macos_alias,
+    smk_engine_set_roots, smk_engine_set_visible_root, smk_engine_verify_edit_password_sha256,
+    smk_engine_write_script_metadata_file, smk_scan_result_change_info,
+    smk_scan_result_file_entries, smk_scan_result_file_entry_changes, smk_scan_result_file_issues,
     smk_scan_result_file_items, smk_scan_result_file_lists, smk_scan_result_free,
-    smk_scan_result_items, smk_scan_result_roots, smk_scan_result_update_info,
-    smk_scan_result_update_resolutions, smk_scan_result_update_statuses,
+    smk_scan_result_items, smk_scan_result_operation_info, smk_scan_result_roots,
+    smk_scan_result_update_info, smk_scan_result_update_resolutions,
+    smk_scan_result_update_statuses,
 };
 #[cfg(feature = "native-watch")]
 use scriptmetakit_ffi::{
@@ -118,6 +130,27 @@ fn scans_items_through_opaque_handle_and_slice() {
     assert_eq!(file_entries[0].can_append_scriptmeta, 0);
     assert_eq!(utf8(file_entries[0].scriptmeta_edit_state), "editable");
 
+    let mut operation = SmkOperationInfo::default();
+    // SAFETY: `scan_result` is live and `operation` is a valid out pointer.
+    assert_eq!(
+        unsafe { smk_scan_result_operation_info(scan_result, &mut operation) },
+        SmkStatus::Ok
+    );
+    assert_eq!(utf8(operation.status), "finished");
+    assert_eq!(operation.total_units, 1);
+    assert_eq!(operation.cancelled, 0);
+
+    let mut file_issues = SmkFileIssueSlice {
+        ptr: ptr::null(),
+        len: 0,
+    };
+    // SAFETY: `scan_result` is live and `file_issues` is a valid out pointer.
+    assert_eq!(
+        unsafe { smk_scan_result_file_issues(scan_result, &mut file_issues) },
+        SmkStatus::Ok
+    );
+    assert_eq!(file_issues.len, 0);
+
     let mut update_info = SmkUpdateCheckInfo {
         has_update_check: 1,
         checked_at: 1,
@@ -167,9 +200,208 @@ fn configures_alias_resolution_through_ffi() {
         unsafe { smk_engine_set_resolve_macos_alias(engine, 1) },
         SmkStatus::Ok
     );
+    // SAFETY: `engine` is live and owned by this test.
+    assert_eq!(
+        unsafe { smk_engine_cancel_current_operation(engine) },
+        SmkStatus::Ok
+    );
 
     // SAFETY: `engine` was returned by `smk_engine_create_default` and has not been freed.
     unsafe {
+        smk_engine_free(engine);
+    }
+}
+
+#[test]
+fn reads_script_metadata_edit_preview_through_ffi() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let script_path = temp.path().join("Preview.jsx");
+    let source = format!(
+        "{}\n/*\nSCRIPTMETA-BEGIN\nScript-ID=com.example.ffi.preview\nSCRIPTMETA-END\n*/\n",
+        "alert('x');\n".repeat(512)
+    );
+    std::fs::write(&script_path, source.as_bytes()).expect("script");
+
+    let mut engine: *mut SmkEngine = ptr::null_mut();
+    // SAFETY: `engine` is a valid out pointer for the duration of this call.
+    assert_eq!(
+        unsafe { smk_engine_create_default(&mut engine) },
+        SmkStatus::Ok
+    );
+
+    let path = script_path.to_string_lossy().into_owned();
+    let mut edit_result: *mut SmkEditResult = ptr::null_mut();
+    // SAFETY: `engine` is live, path bytes remain valid for the call, and output is writable.
+    assert_eq!(
+        unsafe {
+            smk_engine_read_script_metadata_edit_preview_file(
+                engine,
+                utf8_slice(&path),
+                128,
+                &mut edit_result,
+            )
+        },
+        SmkStatus::Ok
+    );
+    assert!(!edit_result.is_null());
+
+    let mut preview = SmkScriptMetadataEditPreviewResult::default();
+    // SAFETY: `edit_result` is live and `preview` is a valid out pointer.
+    assert_eq!(
+        unsafe { smk_edit_result_metadata_edit_preview_result(edit_result, &mut preview) },
+        SmkStatus::Ok
+    );
+    assert_eq!(preview.preview_byte_count, 128);
+    assert_eq!(preview.file_size, source.len() as u64);
+    assert_eq!(preview.has_file_size, 1);
+    assert_eq!(utf8(preview.comment_style), "javascript_block");
+    assert_eq!(preview.is_truncated, 1);
+    assert_eq!(preview.requires_full_read, 1);
+    assert_eq!(preview.has_scriptmeta_marker_in_preview, 0);
+    assert!(!utf8(preview.preview_text).is_empty());
+    assert!(!utf8(preview.file_state_fingerprint).is_empty());
+
+    // SAFETY: both handles were returned by this FFI crate and have not been freed.
+    unsafe {
+        smk_edit_result_free(edit_result);
+        smk_engine_free(engine);
+    }
+}
+
+#[test]
+fn scans_registered_roots_with_app_supplied_root_ids() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let first_root = temp.path().join("first");
+    let second_root = temp.path().join("second");
+    std::fs::create_dir_all(&first_root).expect("first root");
+    std::fs::create_dir_all(&second_root).expect("second root");
+    std::fs::write(
+        first_root.join("One.jsx"),
+        "// SCRIPTMETA-BEGIN\n// Script-ID: com.example.one\n// Version: 1.0.0\n// SCRIPTMETA-END\n",
+    )
+    .expect("one script");
+    std::fs::write(
+        second_root.join("Two.jsx"),
+        "// SCRIPTMETA-BEGIN\n// Script-ID: com.example.two\n// Version: 2.0.0\n// SCRIPTMETA-END\n",
+    )
+    .expect("two script");
+
+    let mut engine: *mut SmkEngine = ptr::null_mut();
+    // SAFETY: `engine` is a valid out pointer for the duration of this call.
+    assert_eq!(
+        unsafe { smk_engine_create_default(&mut engine) },
+        SmkStatus::Ok
+    );
+    assert!(!engine.is_null());
+
+    let first_id = "scripta.photoshop";
+    let second_id = "acemenu.background";
+    let first_path = first_root.to_string_lossy().into_owned();
+    let second_path = second_root.to_string_lossy().into_owned();
+    let roots = [
+        SmkRootRegistration {
+            root_id: utf8_slice(first_id),
+            path: utf8_slice(&first_path),
+            display_name: utf8_slice("Photoshop Scripts"),
+            purpose: 3,
+            watch_policy: 2,
+            cache_policy: 3,
+            refresh_policy: 2,
+            priority: 1,
+        },
+        SmkRootRegistration {
+            root_id: utf8_slice(second_id),
+            path: utf8_slice(&second_path),
+            display_name: utf8_slice("ACEMenu Scripts"),
+            purpose: 1,
+            watch_policy: 0,
+            cache_policy: 2,
+            refresh_policy: 0,
+            priority: 2,
+        },
+    ];
+
+    // SAFETY: `engine` is live and root slices remain valid for the call.
+    assert_eq!(
+        unsafe { smk_engine_set_roots(engine, roots.as_ptr(), roots.len()) },
+        SmkStatus::Ok
+    );
+
+    let mut scan_result: *mut SmkScanResult = ptr::null_mut();
+    // SAFETY: `engine` is live, roots are configured, and `scan_result` is writable.
+    assert_eq!(
+        unsafe { smk_engine_scan_registered_roots(engine, 2, 0, &mut scan_result) },
+        SmkStatus::Ok
+    );
+    assert!(!scan_result.is_null());
+
+    let mut items = SmkScriptItemSlice {
+        ptr: ptr::null(),
+        len: 0,
+    };
+    // SAFETY: `scan_result` is live and `items` is a valid out pointer.
+    assert_eq!(
+        unsafe { smk_scan_result_items(scan_result, &mut items) },
+        SmkStatus::Ok
+    );
+    assert_eq!(items.len, 2);
+    // SAFETY: `items` is borrowed from `scan_result` and the result is still alive.
+    let items = unsafe { slice::from_raw_parts(items.ptr, items.len) };
+    let root_ids = items
+        .iter()
+        .map(|item| utf8(item.root_id))
+        .collect::<Vec<_>>();
+    assert!(root_ids.iter().any(|value| value == first_id));
+    assert!(root_ids.iter().any(|value| value == second_id));
+
+    let selected_root_ids = [utf8_slice(second_id)];
+    let mut selected_scan_result: *mut SmkScanResult = ptr::null_mut();
+    // SAFETY: `engine` is live, root id slices remain valid for the call, and output is writable.
+    assert_eq!(
+        unsafe {
+            smk_engine_scan_roots(
+                engine,
+                selected_root_ids.as_ptr(),
+                selected_root_ids.len(),
+                2,
+                0,
+                &mut selected_scan_result,
+            )
+        },
+        SmkStatus::Ok
+    );
+    assert!(!selected_scan_result.is_null());
+
+    let mut selected_items = SmkScriptItemSlice {
+        ptr: ptr::null(),
+        len: 0,
+    };
+    // SAFETY: `selected_scan_result` is live and `selected_items` is writable.
+    assert_eq!(
+        unsafe { smk_scan_result_items(selected_scan_result, &mut selected_items) },
+        SmkStatus::Ok
+    );
+    assert_eq!(selected_items.len, 1);
+    // SAFETY: `selected_items` is borrowed from `selected_scan_result`.
+    let selected_items = unsafe { slice::from_raw_parts(selected_items.ptr, selected_items.len) };
+    assert_eq!(utf8(selected_items[0].root_id), second_id);
+    assert_eq!(utf8(selected_items[0].script_id), "com.example.two");
+
+    // SAFETY: `engine` is live and the root id slice is valid for the call.
+    assert_eq!(
+        unsafe { smk_engine_set_visible_root(engine, utf8_slice(second_id), 1) },
+        SmkStatus::Ok
+    );
+    // SAFETY: `engine` is live; has_root_id=0 clears the visible root and ignores the empty slice.
+    assert_eq!(
+        unsafe { smk_engine_set_visible_root(engine, utf8_slice(""), 0) },
+        SmkStatus::Ok
+    );
+
+    // SAFETY: both handles were returned by this FFI crate and have not been freed.
+    unsafe {
+        smk_scan_result_free(selected_scan_result);
+        smk_scan_result_free(scan_result);
         smk_engine_free(engine);
     }
 }
@@ -355,23 +587,31 @@ fn returns_file_items_for_overlapping_registered_roots() {
 #[test]
 fn scans_updates_through_multi_folder_ffi() {
     let temp = tempfile::tempdir().expect("tempdir");
-    let script_path = temp.path().join("Example.jsx");
-    let dist_path = temp.path().join("SCRIPTMETA.txt");
+    let first = temp.path().join("First");
+    let second = temp.path().join("Second");
+    std::fs::create_dir_all(&first).expect("first dir");
+    std::fs::create_dir_all(&second).expect("second dir");
+    let first_script_path = first.join("Example.jsx");
+    let second_script_path = second.join("Example.jsx");
+    let dist_path = temp.path().join("dist").join("SCRIPTMETA.txt");
+    std::fs::create_dir_all(dist_path.parent().expect("dist parent")).expect("dist dir");
     let dist_url = url::Url::from_file_path(&dist_path).expect("file url");
-    std::fs::write(
-        &script_path,
-        format!(
-            r#"
+    for script_path in [&first_script_path, &second_script_path] {
+        std::fs::write(
+            script_path,
+            format!(
+                r#"
 // SCRIPTMETA-BEGIN
 // Script-ID: com.example.ffi.update
-// Version: 1.0.0
+// Version: 2.0.0
 // Meta-URL: {dist_url}
 // Name: FFI Update Example
 // SCRIPTMETA-END
 "#
-        ),
-    )
-    .expect("script");
+            ),
+        )
+        .expect("script");
+    }
     std::fs::write(
         &dist_path,
         r#"
@@ -390,15 +630,21 @@ SCRIPTMETA-DIST-END
         SmkStatus::Ok
     );
 
-    let path = temp.path().to_string_lossy().into_owned();
-    let path_slice = SmkUtf8Slice {
-        ptr: path.as_ptr(),
-        len: path.len(),
-    };
+    let first_path = first.to_string_lossy().into_owned();
+    let second_path = second.to_string_lossy().into_owned();
+    let path_slices = [utf8_slice(&first_path), utf8_slice(&second_path)];
     let mut scan_result: *mut SmkScanResult = ptr::null_mut();
     // SAFETY: `engine` is live, path slice is valid for the call, and `scan_result` is writable.
     assert_eq!(
-        unsafe { smk_engine_scan_folders(engine, &path_slice, 1, 1, &mut scan_result) },
+        unsafe {
+            smk_engine_scan_folders(
+                engine,
+                path_slices.as_ptr(),
+                path_slices.len(),
+                1,
+                &mut scan_result,
+            )
+        },
         SmkStatus::Ok
     );
     assert!(!scan_result.is_null());
@@ -423,10 +669,25 @@ SCRIPTMETA-DIST-END
         unsafe { smk_scan_result_update_statuses(scan_result, &mut statuses) },
         SmkStatus::Ok
     );
-    assert_eq!(statuses.len, 1);
+    assert_eq!(statuses.len, 2);
     // SAFETY: `statuses` is borrowed from `scan_result` and the result is still alive.
     let statuses = unsafe { slice::from_raw_parts(statuses.ptr, statuses.len) };
-    assert_eq!(utf8(statuses[0].status), "update_available");
+    let statuses_by_item_id = statuses
+        .iter()
+        .map(|status| (utf8(status.item_id), utf8(status.status)))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    assert_eq!(
+        statuses_by_item_id
+            .get(&first_script_path.to_string_lossy().into_owned())
+            .map(String::as_str),
+        Some("up_to_date")
+    );
+    assert_eq!(
+        statuses_by_item_id
+            .get(&second_script_path.to_string_lossy().into_owned())
+            .map(String::as_str),
+        Some("up_to_date")
+    );
 
     let mut resolutions = SmkDistributionResolutionEntrySlice {
         ptr: ptr::null(),
@@ -437,13 +698,104 @@ SCRIPTMETA-DIST-END
         unsafe { smk_scan_result_update_resolutions(scan_result, &mut resolutions) },
         SmkStatus::Ok
     );
-    assert_eq!(resolutions.len, 1);
+    assert_eq!(resolutions.len, 2);
     // SAFETY: `resolutions` is borrowed from `scan_result` and the result is still alive.
     let resolutions = unsafe { slice::from_raw_parts(resolutions.ptr, resolutions.len) };
-    assert_eq!(utf8(resolutions[0].latest_version), "2.0.0");
+    assert!(
+        resolutions
+            .iter()
+            .all(|resolution| utf8(resolution.latest_version) == "2.0.0")
+    );
 
     // SAFETY: both handles were returned by this FFI crate and have not been freed.
     unsafe {
+        smk_scan_result_free(scan_result);
+        smk_engine_free(engine);
+    }
+}
+
+#[test]
+fn checks_single_update_item_through_ffi() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let script_path = temp.path().join("Example.jsx");
+    let dist_path = temp.path().join("SCRIPTMETA.txt");
+    let dist_url = url::Url::from_file_path(&dist_path).expect("file url");
+    std::fs::write(
+        &script_path,
+        format!(
+            r#"
+// SCRIPTMETA-BEGIN
+// Script-ID: com.example.ffi.single
+// Version: 1.0.0
+// Meta-URL: {dist_url}
+// SCRIPTMETA-END
+"#
+        ),
+    )
+    .expect("script");
+    std::fs::write(
+        &dist_path,
+        r#"
+SCRIPTMETA-DIST-BEGIN
+Script-ID: com.example.ffi.single
+Latest-Version: 2.0.0
+SCRIPTMETA-DIST-END
+"#,
+    )
+    .expect("dist");
+
+    let mut engine: *mut SmkEngine = ptr::null_mut();
+    // SAFETY: `engine` is a valid out pointer for the duration of this call.
+    assert_eq!(
+        unsafe { smk_engine_create_default(&mut engine) },
+        SmkStatus::Ok
+    );
+
+    let path = temp.path().to_string_lossy().into_owned();
+    let path_slice = utf8_slice(&path);
+    let mut scan_result: *mut SmkScanResult = ptr::null_mut();
+    // SAFETY: `engine` is live, path slice is valid for the call, and `scan_result` is writable.
+    assert_eq!(
+        unsafe { smk_engine_scan_folders(engine, &path_slice, 1, 0, &mut scan_result) },
+        SmkStatus::Ok
+    );
+
+    let mut items = SmkScriptItemSlice {
+        ptr: ptr::null(),
+        len: 0,
+    };
+    // SAFETY: `scan_result` is live and `items` is a valid out pointer.
+    assert_eq!(
+        unsafe { smk_scan_result_items(scan_result, &mut items) },
+        SmkStatus::Ok
+    );
+    assert_eq!(items.len, 1);
+
+    let mut update_result: *mut SmkScanResult = ptr::null_mut();
+    // SAFETY: `items.ptr` points to one item borrowed from a live scan result and output is writable.
+    assert_eq!(
+        unsafe { smk_engine_check_update_item(engine, items.ptr, &mut update_result) },
+        SmkStatus::Ok
+    );
+    assert!(!update_result.is_null());
+
+    let mut statuses = SmkUpdateStatusEntrySlice {
+        ptr: ptr::null(),
+        len: 0,
+    };
+    // SAFETY: `update_result` is live and `statuses` is a valid out pointer.
+    assert_eq!(
+        unsafe { smk_scan_result_update_statuses(update_result, &mut statuses) },
+        SmkStatus::Ok
+    );
+    assert_eq!(statuses.len, 1);
+    // SAFETY: `statuses` is borrowed from `update_result` and the result is still alive.
+    let statuses = unsafe { slice::from_raw_parts(statuses.ptr, statuses.len) };
+    assert_eq!(utf8(statuses[0].status), "update_available");
+
+    // SAFETY: all handles were returned by this FFI crate and have not been freed.
+    unsafe {
+        smk_scan_result_free(update_result);
         smk_scan_result_free(scan_result);
         smk_engine_free(engine);
     }
@@ -874,6 +1226,238 @@ fn stores_last_error_on_invalid_argument() {
     }
 }
 
+#[test]
+fn writes_script_metadata_and_restores_backup_through_ffi() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let backup_root = temp.path().join("Backups");
+    let script_path = temp.path().join("Example.jsx");
+    std::fs::write(&script_path, "alert('before');\n").expect("script");
+
+    let mut engine: *mut SmkEngine = ptr::null_mut();
+    // SAFETY: `engine` is a valid out pointer for the duration of this call.
+    assert_eq!(
+        unsafe { smk_engine_create_default(&mut engine) },
+        SmkStatus::Ok
+    );
+
+    let file_path = script_path.to_string_lossy().into_owned();
+    let backup_root_path = backup_root.to_string_lossy().into_owned();
+    let script_id = "com.example.editkit";
+    let version = "1.0.0";
+    let name = "EditKit Example";
+    let draft = SmkScriptMetadataDraft {
+        script_id: utf8_slice(script_id),
+        version: utf8_slice(version),
+        name: utf8_slice(name),
+        ..SmkScriptMetadataDraft::default()
+    };
+    let request = SmkScriptMetadataWriteRequest {
+        file_path: utf8_slice(&file_path),
+        backup_root_path: utf8_slice(&backup_root_path),
+        write_mode: 0,
+        draft,
+    };
+    let mut edit_result: *mut SmkEditResult = ptr::null_mut();
+    // SAFETY: `engine` is live, request slices are valid for this call, and output is writable.
+    assert_eq!(
+        unsafe { smk_engine_write_script_metadata_file(engine, &request, &mut edit_result) },
+        SmkStatus::Ok
+    );
+    assert!(!edit_result.is_null());
+
+    let mut write_result = SmkScriptMetadataFileWriteResult::default();
+    // SAFETY: `edit_result` is live and output is writable.
+    assert_eq!(
+        unsafe { smk_edit_result_file_write_result(edit_result, &mut write_result) },
+        SmkStatus::Ok
+    );
+    assert_eq!(utf8(write_result.operation), "inserted");
+    assert_eq!(write_result.has_backup, 1);
+    assert!(!utf8(write_result.backup.id).is_empty());
+    let updated = std::fs::read_to_string(&script_path).expect("updated");
+    assert!(updated.contains("SCRIPTMETA-BEGIN"));
+    assert!(updated.contains("Script-ID=com.example.editkit"));
+    // SAFETY: handle was returned by this FFI crate and has not been freed.
+    unsafe {
+        smk_edit_result_free(edit_result);
+    }
+
+    let mut generations_result: *mut SmkEditResult = ptr::null_mut();
+    // SAFETY: `engine` is live, path slices are valid for this call, and output is writable.
+    assert_eq!(
+        unsafe {
+            smk_engine_scriptmeta_backup_generations(
+                engine,
+                utf8_slice(&file_path),
+                utf8_slice(&backup_root_path),
+                &mut generations_result,
+            )
+        },
+        SmkStatus::Ok
+    );
+    assert!(!generations_result.is_null());
+    let mut generation_slice = SmkScriptMetaBackupGenerationSlice::default();
+    // SAFETY: `generations_result` is live and output is writable.
+    assert_eq!(
+        unsafe { smk_edit_result_backup_generations(generations_result, &mut generation_slice) },
+        SmkStatus::Ok
+    );
+    // SAFETY: the slice is borrowed from a live edit result.
+    let generations = unsafe { slice::from_raw_parts(generation_slice.ptr, generation_slice.len) };
+    assert!(generations.len() >= 2);
+    let original_generation_id = generations
+        .iter()
+        .find(|generation| generation.is_current_file == 0)
+        .map(|generation| utf8(generation.id))
+        .expect("original generation");
+    // SAFETY: handle was returned by this FFI crate and has not been freed.
+    unsafe {
+        smk_edit_result_free(generations_result);
+    }
+
+    let mut restore_result: *mut SmkEditResult = ptr::null_mut();
+    // SAFETY: `engine` is live, path slices are valid for this call, and output is writable.
+    assert_eq!(
+        unsafe {
+            smk_engine_restore_scriptmeta_backup(
+                engine,
+                utf8_slice(&file_path),
+                utf8_slice(&backup_root_path),
+                utf8_slice(&original_generation_id),
+                &mut restore_result,
+            )
+        },
+        SmkStatus::Ok
+    );
+    assert!(!restore_result.is_null());
+    let mut has_record = 0_u8;
+    let mut record = SmkScriptMetaBackupRecord::default();
+    // SAFETY: `restore_result` is live and output pointers are writable.
+    assert_eq!(
+        unsafe { smk_edit_result_backup_record(restore_result, &mut has_record, &mut record) },
+        SmkStatus::Ok
+    );
+    assert_eq!(has_record, 1);
+    assert_eq!(utf8(record.reason), "before_restore");
+    let restored = std::fs::read_to_string(&script_path).expect("restored");
+    assert!(!restored.contains("SCRIPTMETA-BEGIN"));
+    assert!(restored.contains("alert('before');"));
+
+    // SAFETY: handles were returned by this FFI crate and have not been freed.
+    unsafe {
+        smk_edit_result_free(restore_result);
+        smk_engine_free(engine);
+    }
+}
+
+#[test]
+fn renders_distribution_metadata_through_ffi() {
+    let mut engine: *mut SmkEngine = ptr::null_mut();
+    // SAFETY: `engine` is a valid out pointer for the duration of this call.
+    assert_eq!(
+        unsafe { smk_engine_create_default(&mut engine) },
+        SmkStatus::Ok
+    );
+
+    let script_id = "com.example.dist";
+    let version = "2.0.0";
+    let latest_url = "https://example.com/SCRIPTMETA.txt";
+    let records = [SmkDistributionMetadataDraft {
+        script_id: utf8_slice(script_id),
+        version: utf8_slice(version),
+        latest_url: utf8_slice(latest_url),
+        ..SmkDistributionMetadataDraft::default()
+    }];
+    let mut result: *mut SmkEditResult = ptr::null_mut();
+    // SAFETY: `engine` is live, records are valid for this call, and output is writable.
+    assert_eq!(
+        unsafe {
+            smk_engine_render_distribution_metadata(engine, records.as_ptr(), 1, &mut result)
+        },
+        SmkStatus::Ok
+    );
+    assert!(!result.is_null());
+    let mut text = SmkUtf8Slice::default();
+    // SAFETY: `result` is live and output is writable.
+    assert_eq!(
+        unsafe { smk_edit_result_text(result, &mut text) },
+        SmkStatus::Ok
+    );
+    let text = utf8(text);
+    assert!(text.contains("SCRIPTMETA-DIST-BEGIN"));
+    assert!(text.contains("Script-ID=com.example.dist"));
+    assert!(text.contains("Latest-URL=https://example.com/SCRIPTMETA.txt"));
+
+    // SAFETY: handles were returned by this FFI crate and have not been freed.
+    unsafe {
+        smk_edit_result_free(result);
+        smk_engine_free(engine);
+    }
+}
+
+#[test]
+fn ffi_generates_and_verifies_edit_password_sha256() {
+    let mut engine: *mut SmkEngine = ptr::null_mut();
+    // SAFETY: `engine` is a valid out pointer for the duration of this call.
+    assert_eq!(
+        unsafe { smk_engine_create_default(&mut engine) },
+        SmkStatus::Ok
+    );
+
+    let mut result: *mut SmkEditResult = ptr::null_mut();
+    // SAFETY: `engine` is live and output is writable.
+    assert_eq!(
+        unsafe {
+            smk_engine_generate_edit_password_sha256(engine, utf8_slice("secret"), &mut result)
+        },
+        SmkStatus::Ok
+    );
+    assert!(!result.is_null());
+
+    let mut stored = SmkUtf8Slice::default();
+    // SAFETY: `result` is live and output is writable.
+    assert_eq!(
+        unsafe { smk_edit_result_text(result, &mut stored) },
+        SmkStatus::Ok
+    );
+
+    let stored_text = unsafe {
+        std::str::from_utf8_unchecked(std::slice::from_raw_parts(stored.ptr, stored.len))
+    };
+    let mut is_match = 0;
+    // SAFETY: `engine` is live and output is writable.
+    assert_eq!(
+        unsafe {
+            smk_engine_verify_edit_password_sha256(
+                engine,
+                utf8_slice("secret"),
+                utf8_slice(stored_text),
+                &mut is_match,
+            )
+        },
+        SmkStatus::Ok
+    );
+    assert_eq!(is_match, 1);
+
+    assert_eq!(
+        unsafe {
+            smk_engine_verify_edit_password_sha256(
+                engine,
+                utf8_slice("secret"),
+                utf8_slice("invalid"),
+                &mut is_match,
+            )
+        },
+        SmkStatus::InvalidArgument
+    );
+
+    // SAFETY: result and engine were returned by this crate and are live.
+    unsafe {
+        smk_edit_result_free(result);
+        smk_engine_free(engine);
+    }
+}
+
 fn utf8(value: SmkUtf8Slice) -> String {
     if value.ptr.is_null() || value.len == 0 {
         return String::new();
@@ -881,6 +1465,13 @@ fn utf8(value: SmkUtf8Slice) -> String {
     // SAFETY: tests only read slices returned by live FFI handles.
     let bytes = unsafe { slice::from_raw_parts(value.ptr, value.len) };
     String::from_utf8(bytes.to_vec()).expect("utf8")
+}
+
+fn utf8_slice(value: &str) -> SmkUtf8Slice {
+    SmkUtf8Slice {
+        ptr: value.as_ptr(),
+        len: value.len(),
+    }
 }
 
 extern "C" fn collect_progress_phase(progress: *const SmkUpdateProgress, context: *mut c_void) {

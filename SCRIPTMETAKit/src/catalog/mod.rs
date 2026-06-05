@@ -12,7 +12,7 @@ pub use root::{
 };
 pub use snapshot::{
     CacheInvalidationReason, CacheScope, DirectoryState, DirectoryStateMap, FileEntryChange,
-    FileEntryChangeKind, FileListSnapshot, RefreshRequest, RootError, RootSnapshot, RootStatus,
-    ScanChangeSummary, ScanMode, ScanRequest, ScanResult, ScriptMetaCatalogSnapshot,
+    FileEntryChangeKind, FileIdentity, FileListSnapshot, RefreshRequest, RootError, RootSnapshot,
+    RootStatus, ScanChangeSummary, ScanMode, ScanRequest, ScanResult, ScriptMetaCatalogSnapshot,
     UpdateCheckRequest, UpdateCheckResult, UpdateFailure, UpdateStatus, unresolved_distribution,
 };

@@ -1,8 +1,9 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::File,
     io::{self, Read},
-    time::Duration,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 #[cfg(feature = "blocking-http")]
@@ -12,11 +13,15 @@ use url::Url;
 use crate::{
     TimestampMillis,
     core::{
-        DistributionResolution, ScriptMetaItem, ScriptMetaKitError, ScriptMetaKitResult,
-        VersionOrdering, compare_versions, parse_distribution_metadata_for_script,
+        DistributionMetadata, DistributionResolution, ScriptMetaItem, ScriptMetaKitError,
+        ScriptMetaKitResult, VersionOrdering, compare_versions, decode_script_text,
+        parse_distribution_metadata_records, select_distribution_metadata_for_script,
     },
     now_timestamp_millis,
 };
+
+const MAX_SOURCE_CACHE_COUNT: usize = 4;
+const MAX_PARSED_CACHE_COUNT: usize = 8;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DistributionResolverOptions {
@@ -26,6 +31,10 @@ pub struct DistributionResolverOptions {
     /// Use 0 to disable this block-size guard.
     pub max_metadata_block_bytes: usize,
     pub request_timeout_millis: Option<u64>,
+    /// Maximum elapsed time while streaming one metadata source.
+    /// This is checked between read calls and cannot interrupt a blocked OS read.
+    pub resource_timeout_millis: Option<u64>,
+    pub cache_enabled: bool,
 }
 
 impl Default for DistributionResolverOptions {
@@ -34,6 +43,8 @@ impl Default for DistributionResolverOptions {
             max_redirects: 8,
             max_metadata_block_bytes: 256 * 1024,
             request_timeout_millis: Some(15_000),
+            resource_timeout_millis: Some(15_000),
+            cache_enabled: true,
         }
     }
 }
@@ -41,8 +52,17 @@ impl Default for DistributionResolverOptions {
 #[derive(Clone, Debug)]
 pub struct DistributionResolver {
     options: DistributionResolverOptions,
+    cache: Arc<Mutex<DistributionResolverCache>>,
     #[cfg(feature = "blocking-http")]
     client: Client,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DistributionResolverCache {
+    source_cache: BTreeMap<String, Arc<LoadedMetadataSource>>,
+    source_order: Vec<String>,
+    parsed_cache: BTreeMap<String, Arc<Vec<DistributionMetadata>>>,
+    parsed_order: Vec<String>,
 }
 
 impl DistributionResolver {
@@ -56,13 +76,21 @@ impl DistributionResolver {
             let client = builder
                 .build()
                 .map_err(|error| ScriptMetaKitError::Url(error.to_string()))?;
-            Ok(Self { options, client })
+            Ok(Self {
+                options,
+                cache: Arc::new(Mutex::new(DistributionResolverCache::default())),
+                client,
+            })
         }
 
         #[cfg(not(feature = "blocking-http"))]
         {
             let _ = Duration::from_millis(options.request_timeout_millis.unwrap_or(0));
-            Ok(Self { options })
+            let _ = Duration::from_millis(options.resource_timeout_millis.unwrap_or(0));
+            Ok(Self {
+                options,
+                cache: Arc::new(Mutex::new(DistributionResolverCache::default())),
+            })
         }
     }
 
@@ -80,7 +108,8 @@ impl DistributionResolver {
 
         loop {
             let source = self.load_source(&current_url)?;
-            let metadata = parse_distribution_metadata_for_script(&source.text, script_id)?;
+            let records = self.parse_distribution_records(&source)?;
+            let metadata = select_distribution_metadata_for_script(&records, script_id)?;
 
             if let Some(metadata_script_id) = &metadata.script_id
                 && metadata_script_id != script_id
@@ -89,7 +118,7 @@ impl DistributionResolver {
                 return Ok(DistributionResolution {
                     latest_version: None,
                     latest_page_url: metadata.latest_page_url,
-                    final_page_url: source.resolved_url,
+                    final_page_url: source.resolved_url.clone(),
                     latest_url_history,
                     checked_at,
                     is_unresolved: true,
@@ -114,7 +143,7 @@ impl DistributionResolver {
                     return Ok(DistributionResolution {
                         latest_version: metadata.latest_version,
                         latest_page_url: metadata.latest_page_url.or(last_redirect_url),
-                        final_page_url: source.resolved_url,
+                        final_page_url: source.resolved_url.clone(),
                         latest_url_history,
                         checked_at,
                         is_unresolved,
@@ -128,7 +157,7 @@ impl DistributionResolver {
                     return Ok(DistributionResolution {
                         latest_version: metadata.latest_version,
                         latest_page_url: metadata.latest_page_url.or(last_redirect_url),
-                        final_page_url: source.resolved_url,
+                        final_page_url: source.resolved_url.clone(),
                         latest_url_history,
                         checked_at,
                         is_unresolved,
@@ -141,7 +170,7 @@ impl DistributionResolver {
                     return Ok(DistributionResolution {
                         latest_version: metadata.latest_version,
                         latest_page_url: metadata.latest_page_url.or(last_redirect_url),
-                        final_page_url: source.resolved_url,
+                        final_page_url: source.resolved_url.clone(),
                         latest_url_history,
                         checked_at,
                         is_unresolved: true,
@@ -167,7 +196,7 @@ impl DistributionResolver {
             return Ok(DistributionResolution {
                 latest_version: metadata.latest_version,
                 latest_page_url,
-                final_page_url: source.resolved_url,
+                final_page_url: source.resolved_url.clone(),
                 latest_url_history,
                 checked_at,
                 is_unresolved,
@@ -177,7 +206,22 @@ impl DistributionResolver {
         }
     }
 
-    fn load_source(&self, url: &Url) -> ScriptMetaKitResult<LoadedMetadataSource> {
+    fn load_source(&self, url: &Url) -> ScriptMetaKitResult<Arc<LoadedMetadataSource>> {
+        let cache_key = url.as_str().to_string();
+        if self.options.cache_enabled
+            && let Some(source) = self.cached_source(&cache_key)?
+        {
+            return Ok(source);
+        }
+
+        let source = Arc::new(self.load_uncached_source(url)?);
+        if self.options.cache_enabled {
+            self.store_source(cache_key, Arc::clone(&source))?;
+        }
+        Ok(source)
+    }
+
+    fn load_uncached_source(&self, url: &Url) -> ScriptMetaKitResult<LoadedMetadataSource> {
         if is_gist_url(url) {
             return self.load_first_valid_metadata_source(
                 url,
@@ -200,6 +244,81 @@ impl DistributionResolver {
             );
         }
         self.load_plain_source(url)
+    }
+
+    fn parse_distribution_records(
+        &self,
+        source: &LoadedMetadataSource,
+    ) -> ScriptMetaKitResult<Arc<Vec<DistributionMetadata>>> {
+        let cache_key = source.resolved_url.as_str().to_string();
+        if self.options.cache_enabled
+            && let Some(records) = self.cached_records(&cache_key)?
+        {
+            return Ok(records);
+        }
+
+        let records = Arc::new(parse_distribution_metadata_records(&source.text)?);
+        if self.options.cache_enabled {
+            self.store_records(cache_key, Arc::clone(&records))?;
+        }
+        Ok(records)
+    }
+
+    fn cached_source(&self, key: &str) -> ScriptMetaKitResult<Option<Arc<LoadedMetadataSource>>> {
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| ScriptMetaKitError::Cache("distribution cache is poisoned".to_string()))?;
+        let source = cache.source_cache.get(key).cloned();
+        if source.is_some() {
+            touch_cache_key(&mut cache.source_order, key);
+        }
+        Ok(source)
+    }
+
+    fn store_source(
+        &self,
+        key: String,
+        source: Arc<LoadedMetadataSource>,
+    ) -> ScriptMetaKitResult<()> {
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| ScriptMetaKitError::Cache("distribution cache is poisoned".to_string()))?;
+        cache.source_cache.insert(key.clone(), source);
+        touch_cache_key(&mut cache.source_order, &key);
+        evict_source_cache_entries(&mut cache);
+        Ok(())
+    }
+
+    fn cached_records(
+        &self,
+        key: &str,
+    ) -> ScriptMetaKitResult<Option<Arc<Vec<DistributionMetadata>>>> {
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| ScriptMetaKitError::Cache("distribution cache is poisoned".to_string()))?;
+        let records = cache.parsed_cache.get(key).cloned();
+        if records.is_some() {
+            touch_cache_key(&mut cache.parsed_order, key);
+        }
+        Ok(records)
+    }
+
+    fn store_records(
+        &self,
+        key: String,
+        records: Arc<Vec<DistributionMetadata>>,
+    ) -> ScriptMetaKitResult<()> {
+        let mut cache = self
+            .cache
+            .lock()
+            .map_err(|_| ScriptMetaKitError::Cache("distribution cache is poisoned".to_string()))?;
+        cache.parsed_cache.insert(key.clone(), records);
+        touch_cache_key(&mut cache.parsed_order, &key);
+        evict_parsed_cache_entries(&mut cache);
+        Ok(())
     }
 
     fn load_plain_source(&self, url: &Url) -> ScriptMetaKitResult<LoadedMetadataSource> {
@@ -253,14 +372,17 @@ impl DistributionResolver {
             path: path.clone(),
             message: error.to_string(),
         })?;
-        read_metadata_source_block(&mut file, self.options.max_metadata_block_bytes).map_err(
-            |error| {
-                map_metadata_source_error(error, |error| ScriptMetaKitError::Io {
-                    path,
-                    message: error.to_string(),
-                })
-            },
+        read_metadata_source_block(
+            &mut file,
+            self.options.max_metadata_block_bytes,
+            self.options.resource_timeout_millis,
         )
+        .map_err(|error| {
+            map_metadata_source_error(error, |error| ScriptMetaKitError::Io {
+                path,
+                message: error.to_string(),
+            })
+        })
     }
 
     #[cfg(feature = "blocking-http")]
@@ -272,10 +394,14 @@ impl DistributionResolver {
             .and_then(reqwest::blocking::Response::error_for_status)
             .map_err(|error| ScriptMetaKitError::Url(error.to_string()))?;
         let resolved_url = response.url().clone();
-        let text = read_metadata_source_block(&mut response, self.options.max_metadata_block_bytes)
-            .map_err(|error| {
-                map_metadata_source_error(error, |error| ScriptMetaKitError::Url(error.to_string()))
-            })?;
+        let text = read_metadata_source_block(
+            &mut response,
+            self.options.max_metadata_block_bytes,
+            self.options.resource_timeout_millis,
+        )
+        .map_err(|error| {
+            map_metadata_source_error(error, |error| ScriptMetaKitError::Url(error.to_string()))
+        })?;
         Ok(LoadedMetadataSource { text, resolved_url })
     }
 
@@ -293,6 +419,37 @@ struct LoadedMetadataSource {
     resolved_url: Url,
 }
 
+fn touch_cache_key(order: &mut Vec<String>, key: &str) {
+    order.retain(|cached_key| cached_key != key);
+    order.push(key.to_string());
+}
+
+fn evict_source_cache_entries(cache: &mut DistributionResolverCache) {
+    if MAX_SOURCE_CACHE_COUNT == 0 {
+        cache.source_cache.clear();
+        cache.source_order.clear();
+        return;
+    }
+
+    while cache.source_order.len() > MAX_SOURCE_CACHE_COUNT {
+        let evicted = cache.source_order.remove(0);
+        cache.source_cache.remove(&evicted);
+    }
+}
+
+fn evict_parsed_cache_entries(cache: &mut DistributionResolverCache) {
+    if MAX_PARSED_CACHE_COUNT == 0 {
+        cache.parsed_cache.clear();
+        cache.parsed_order.clear();
+        return;
+    }
+
+    while cache.parsed_order.len() > MAX_PARSED_CACHE_COUNT {
+        let evicted = cache.parsed_order.remove(0);
+        cache.parsed_cache.remove(&evicted);
+    }
+}
+
 const SOURCE_READ_CHUNK_BYTES: usize = 16 * 1024;
 const SOURCE_MARKER_TAIL_BYTES: usize = b"SCRIPTMETA-DIST-BEGIN".len() - 1;
 const DIST_BEGIN_BYTES: &[u8] = b"SCRIPTMETA-DIST-BEGIN";
@@ -302,6 +459,7 @@ const BODY_BEGIN_BYTES: &[u8] = b"<body";
 #[derive(Debug)]
 enum MetadataSourceReadError {
     Io(io::Error),
+    Timeout(String),
     Parse(String),
 }
 
@@ -317,6 +475,7 @@ fn map_metadata_source_error(
 ) -> ScriptMetaKitError {
     match error {
         MetadataSourceReadError::Io(error) => io_error(error),
+        MetadataSourceReadError::Timeout(message) => ScriptMetaKitError::Timeout(message),
         MetadataSourceReadError::Parse(message) => ScriptMetaKitError::Parse(message),
     }
 }
@@ -324,8 +483,11 @@ fn map_metadata_source_error(
 fn read_metadata_source_block(
     reader: &mut impl Read,
     max_block_bytes: usize,
+    resource_timeout_millis: Option<u64>,
 ) -> Result<String, MetadataSourceReadError> {
     let mut chunk = [0_u8; SOURCE_READ_CHUNK_BYTES];
+    let started = Instant::now();
+    let timeout = resource_timeout_millis.map(Duration::from_millis);
     let mut body_tail = Vec::with_capacity(SOURCE_MARKER_TAIL_BYTES);
     let mut body_search_buffer =
         Vec::with_capacity(SOURCE_READ_CHUNK_BYTES + SOURCE_MARKER_TAIL_BYTES);
@@ -335,7 +497,9 @@ fn read_metadata_source_block(
     let mut found_body = false;
 
     loop {
+        check_resource_timeout(started, timeout)?;
         let read_len = reader.read(&mut chunk)?;
+        check_resource_timeout(started, timeout)?;
         if read_len == 0 {
             break;
         }
@@ -386,6 +550,21 @@ fn read_metadata_source_block(
     ))
 }
 
+fn check_resource_timeout(
+    started: Instant,
+    timeout: Option<Duration>,
+) -> Result<(), MetadataSourceReadError> {
+    if let Some(timeout) = timeout
+        && started.elapsed() >= timeout
+    {
+        return Err(MetadataSourceReadError::Timeout(format!(
+            "metadata source read timed out after {} ms",
+            timeout.as_millis()
+        )));
+    }
+    Ok(())
+}
+
 struct MetadataBlockScanner {
     max_block_bytes: usize,
     tail: Vec<u8>,
@@ -413,7 +592,9 @@ impl MetadataBlockScanner {
                 .len()
                 .saturating_sub(DIST_END_BYTES.len().saturating_sub(1));
             append_metadata_bytes(block, bytes, self.max_block_bytes, "SCRIPTMETA-DIST")?;
-            if let Some(end_offset) = find_bytes(&block[search_start..], DIST_END_BYTES) {
+            if let Some(end_offset) =
+                find_ascii_case_insensitive_bytes(&block[search_start..], DIST_END_BYTES)
+            {
                 let end_index = search_start + end_offset + DIST_END_BYTES.len();
                 block.truncate(end_index);
                 let block = self.dist_block.take().expect("active distribution block");
@@ -426,13 +607,17 @@ impl MetadataBlockScanner {
         self.search_buffer.extend_from_slice(&self.tail);
         self.search_buffer.extend_from_slice(bytes);
 
-        if let Some(begin_index) = find_bytes(&self.search_buffer, DIST_BEGIN_BYTES) {
+        if let Some(begin_index) =
+            find_ascii_case_insensitive_bytes(&self.search_buffer, DIST_BEGIN_BYTES)
+        {
             let mut block = metadata_block_from_bytes(
                 &self.search_buffer[begin_index..],
                 self.max_block_bytes,
                 "SCRIPTMETA-DIST",
             )?;
-            if let Some(end_offset) = find_bytes(&block[DIST_BEGIN_BYTES.len()..], DIST_END_BYTES) {
+            if let Some(end_offset) =
+                find_ascii_case_insensitive_bytes(&block[DIST_BEGIN_BYTES.len()..], DIST_END_BYTES)
+            {
                 let end_index = DIST_BEGIN_BYTES.len() + end_offset + DIST_END_BYTES.len();
                 block.truncate(end_index);
                 return Ok(Some(block));
@@ -477,22 +662,13 @@ fn append_metadata_bytes(
 }
 
 fn metadata_block_to_string(bytes: Vec<u8>) -> String {
-    match String::from_utf8(bytes) {
-        Ok(text) => text,
-        Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
-    }
+    decode_script_text(&bytes)
 }
 
 fn update_search_tail(tail: &mut Vec<u8>, source: &[u8]) {
     tail.clear();
     let start = source.len().saturating_sub(SOURCE_MARKER_TAIL_BYTES);
     tail.extend_from_slice(&source[start..]);
-}
-
-fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
 }
 
 fn find_ascii_case_insensitive_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -657,7 +833,8 @@ mod tests {
     use std::io::Cursor;
 
     use super::{
-        DIST_BEGIN_BYTES, DistributionResolverOptions, SOURCE_READ_CHUNK_BYTES,
+        DIST_BEGIN_BYTES, DistributionResolver, DistributionResolverOptions,
+        MAX_PARSED_CACHE_COUNT, MAX_SOURCE_CACHE_COUNT, SOURCE_READ_CHUNK_BYTES,
         gist_raw_content_urls, github_directory_raw_content_urls,
         github_repository_raw_content_urls, is_gist_url, is_github_directory_url,
         is_github_repository_url, read_metadata_source_block,
@@ -736,6 +913,7 @@ mod tests {
         let block = read_metadata_source_block(
             &mut reader,
             DistributionResolverOptions::default().max_metadata_block_bytes,
+            None,
         )
         .expect("metadata block");
 
@@ -755,10 +933,26 @@ mod tests {
         let block = read_metadata_source_block(
             &mut reader,
             DistributionResolverOptions::default().max_metadata_block_bytes,
+            None,
         )
         .expect("metadata block");
 
         assert!(block.contains("Script-ID: com.example.split"));
+    }
+
+    #[test]
+    fn reads_distribution_markers_case_insensitively() {
+        let source = b"scriptmeta-dist-begin\nScript-ID: com.example.case\nVersion: 1.0.0\nscriptmeta-dist-end";
+        let mut reader = Cursor::new(source);
+
+        let block = read_metadata_source_block(
+            &mut reader,
+            DistributionResolverOptions::default().max_metadata_block_bytes,
+            None,
+        )
+        .expect("metadata block");
+
+        assert!(block.contains("Script-ID: com.example.case"));
     }
 
     #[test]
@@ -769,6 +963,7 @@ mod tests {
         let block = read_metadata_source_block(
             &mut reader,
             DistributionResolverOptions::default().max_metadata_block_bytes,
+            None,
         )
         .expect("metadata block");
 
@@ -793,6 +988,7 @@ mod tests {
         let block = read_metadata_source_block(
             &mut reader,
             DistributionResolverOptions::default().max_metadata_block_bytes,
+            None,
         )
         .expect("metadata block");
 
@@ -815,6 +1011,7 @@ mod tests {
         let error = read_metadata_source_block(
             &mut reader,
             DistributionResolverOptions::default().max_metadata_block_bytes,
+            None,
         )
         .expect_err("head metadata should not be used when an HTML body exists");
 
@@ -832,11 +1029,147 @@ mod tests {
         let error = read_metadata_source_block(
             &mut reader,
             DistributionResolverOptions::default().max_metadata_block_bytes,
+            None,
         )
         .expect_err("legacy script block is not distribution metadata");
 
         assert!(
             matches!(error, super::MetadataSourceReadError::Parse(message) if message == "missing SCRIPTMETA distribution block")
         );
+    }
+
+    #[test]
+    fn times_out_metadata_source_read_between_chunks() {
+        let source = b"SCRIPTMETA-DIST-BEGIN\nScript-ID: com.example.timeout\n";
+        let mut reader = Cursor::new(source);
+
+        let error = read_metadata_source_block(
+            &mut reader,
+            DistributionResolverOptions::default().max_metadata_block_bytes,
+            Some(0),
+        )
+        .expect_err("zero timeout should stop the stream");
+
+        assert!(
+            matches!(error, super::MetadataSourceReadError::Timeout(message) if message.contains("timed out"))
+        );
+    }
+
+    #[test]
+    fn reuses_loaded_distribution_source_in_one_resolver() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let metadata_path = temp.path().join("SCRIPTMETA.txt");
+        std::fs::write(
+            &metadata_path,
+            "SCRIPTMETA-DIST-BEGIN\n\
+Script-ID: com.example.one\nVersion: 1.0.0\n\
+Script-ID: com.example.two\nVersion: 2.0.0\n\
+SCRIPTMETA-DIST-END\n",
+        )
+        .expect("metadata");
+
+        let resolver =
+            DistributionResolver::new(DistributionResolverOptions::default()).expect("resolver");
+        let url = Url::from_file_path(&metadata_path).expect("file url");
+
+        let first = resolver
+            .resolve(&url, "com.example.one", 1)
+            .expect("first resolution");
+        assert_eq!(first.latest_version.as_deref(), Some("1.0.0"));
+
+        std::fs::write(
+            &metadata_path,
+            "SCRIPTMETA-DIST-BEGIN\n\
+Script-ID: com.example.two\nVersion: 9.0.0\n\
+SCRIPTMETA-DIST-END\n",
+        )
+        .expect("rewrite metadata");
+
+        let second = resolver
+            .resolve(&url, "com.example.two", 2)
+            .expect("second resolution");
+        assert_eq!(second.latest_version.as_deref(), Some("2.0.0"));
+
+        let cache = resolver.cache.lock().expect("resolver cache");
+        assert_eq!(cache.source_cache.len(), 1);
+        assert_eq!(cache.parsed_cache.len(), 1);
+    }
+
+    #[test]
+    fn reuses_latest_url_chain_sources_in_one_resolver() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let first_path = temp.path().join("first.txt");
+        let second_path = temp.path().join("second.txt");
+        let second_url = Url::from_file_path(&second_path).expect("second file url");
+        std::fs::write(
+            &first_path,
+            format!(
+                "SCRIPTMETA-DIST-BEGIN\n\
+Script-ID: com.example.one\nLatest-URL: {second_url}\n\
+SCRIPTMETA-DIST-END\n"
+            ),
+        )
+        .expect("first metadata");
+        std::fs::write(
+            &second_path,
+            "SCRIPTMETA-DIST-BEGIN\n\
+Script-ID: com.example.one\nVersion: 3.0.0\n\
+SCRIPTMETA-DIST-END\n",
+        )
+        .expect("second metadata");
+
+        let resolver =
+            DistributionResolver::new(DistributionResolverOptions::default()).expect("resolver");
+        let first_url = Url::from_file_path(&first_path).expect("first file url");
+        let first = resolver
+            .resolve(&first_url, "com.example.one", 1)
+            .expect("first resolution");
+        assert_eq!(first.latest_version.as_deref(), Some("3.0.0"));
+
+        std::fs::write(
+            &second_path,
+            "SCRIPTMETA-DIST-BEGIN\n\
+Script-ID: com.example.one\nVersion: 9.0.0\n\
+SCRIPTMETA-DIST-END\n",
+        )
+        .expect("rewrite second metadata");
+
+        let second = resolver
+            .resolve(&first_url, "com.example.one", 2)
+            .expect("second resolution");
+        assert_eq!(second.latest_version.as_deref(), Some("3.0.0"));
+
+        let cache = resolver.cache.lock().expect("resolver cache");
+        assert_eq!(cache.source_cache.len(), 2);
+        assert_eq!(cache.parsed_cache.len(), 2);
+    }
+
+    #[test]
+    fn caps_distribution_resolver_cache_sizes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let resolver =
+            DistributionResolver::new(DistributionResolverOptions::default()).expect("resolver");
+
+        for index in 0..(MAX_PARSED_CACHE_COUNT + 2) {
+            let metadata_path = temp.path().join(format!("SCRIPTMETA-{index}.txt"));
+            std::fs::write(
+                &metadata_path,
+                format!(
+                    "SCRIPTMETA-DIST-BEGIN\nScript-ID: com.example.{index}\nVersion: {index}.0.0\nSCRIPTMETA-DIST-END\n"
+                ),
+            )
+            .expect("metadata");
+            let url = Url::from_file_path(&metadata_path).expect("file url");
+            let script_id = format!("com.example.{index}");
+            resolver
+                .resolve(&url, &script_id, index as u64)
+                .expect("resolution");
+        }
+
+        let cache = resolver.cache.lock().expect("resolver cache");
+        assert_eq!(cache.source_cache.len(), MAX_SOURCE_CACHE_COUNT);
+        assert_eq!(cache.source_order.len(), MAX_SOURCE_CACHE_COUNT);
+        assert_eq!(cache.parsed_cache.len(), MAX_PARSED_CACHE_COUNT);
+        assert_eq!(cache.parsed_order.len(), MAX_PARSED_CACHE_COUNT);
     }
 }

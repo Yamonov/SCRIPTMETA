@@ -6,7 +6,10 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{scanner::ScannerOptions, watcher::normalize_path};
+use crate::{
+    scanner::{ExtensionPolicy, ScannerOptions},
+    watcher::normalize_path,
+};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -82,6 +85,7 @@ pub(crate) fn resolve_scannable_path(
     display_path: PathBuf,
     source_path: PathBuf,
     options: &ScannerOptions,
+    extensions: Option<&ExtensionPolicy>,
 ) -> ResolvedPath {
     let symlink_metadata = fs::symlink_metadata(&source_path);
     if symlink_metadata
@@ -91,7 +95,10 @@ pub(crate) fn resolve_scannable_path(
         return resolve_symlink_path(display_path, source_path, options);
     }
 
-    if options.resolve_macos_alias && is_macos_alias_file(&source_path) {
+    if options.resolve_macos_alias
+        && should_probe_macos_alias_file(&source_path, symlink_metadata.as_ref().ok(), extensions)
+        && is_macos_alias_file(&source_path)
+    {
         return resolve_macos_alias_path(display_path, source_path);
     }
 
@@ -108,6 +115,21 @@ pub(crate) fn resolve_scannable_path(
         resolution_status: PathResolutionStatus::NotRequested,
         resolution_message: None,
     }
+}
+
+fn should_probe_macos_alias_file(
+    path: &Path,
+    metadata: Option<&fs::Metadata>,
+    extensions: Option<&ExtensionPolicy>,
+) -> bool {
+    if !metadata.is_some_and(|metadata| metadata.file_type().is_file()) {
+        return false;
+    }
+
+    let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+        return true;
+    };
+    extensions.is_some_and(|extensions| extensions.contains_extension(extension))
 }
 
 fn resolve_symlink_path(

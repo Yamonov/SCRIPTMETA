@@ -1,8 +1,8 @@
 use std::{
     borrow::Cow,
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    io::Read,
+    io::{self, Read},
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime},
 };
@@ -11,8 +11,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     RootId,
-    catalog::{DirectoryState, DirectoryStateMap, RootError, RootSnapshot, RootStatus},
-    core::ScriptRuntimeKind,
+    catalog::{
+        DirectoryState, DirectoryStateMap, FileEntryChange, FileEntryChangeKind, FileIdentity,
+        FileListSnapshot, RootError, RootSnapshot, RootStatus, ScanChangeSummary,
+    },
+    core::{OperationCancellation, ScriptRuntimeKind},
     now_timestamp_millis,
     scanner::{ExtensionPolicy, ScannerOptions},
     watcher::normalize_path,
@@ -22,6 +25,7 @@ use super::{
     path_resolution::{
         PathKind, PathResolutionStatus, ResolvedPath, path_error_status, resolve_scannable_path,
     },
+    root_preflight::{root_content_preflight_issue, root_location_issue},
     script_detection::{
         detect_script_file, detect_script_file_from_bytes, needs_script_header_probe,
         script_header_probe_byte_limit, scriptmeta_edit_capability_from_file_list_probe,
@@ -43,6 +47,8 @@ pub struct FileSystemEntry {
     pub file_size: Option<u64>,
     #[serde(default)]
     pub content_modified_at: Option<u64>,
+    #[serde(default)]
+    pub identity: Option<FileIdentity>,
     #[serde(default)]
     pub runtime_kind: Option<ScriptRuntimeKind>,
     #[serde(default)]
@@ -70,6 +76,7 @@ pub struct DirectoryScanOutput {
     pub children: Vec<FileSystemEntry>,
     pub directory_states: DirectoryStateMap,
     pub truncated: bool,
+    pub change_summary: Option<ScanChangeSummary>,
 }
 
 pub fn scan_file_list_root(
@@ -78,24 +85,32 @@ pub fn scan_file_list_root(
     options: &ScannerOptions,
     extensions: &ExtensionPolicy,
 ) -> DirectoryScanOutput {
+    scan_file_list_root_controlled(root_id, root_path, options, extensions, None)
+}
+
+pub(crate) fn scan_file_list_root_controlled(
+    root_id: &RootId,
+    root_path: &Path,
+    options: &ScannerOptions,
+    extensions: &ExtensionPolicy,
+    cancellation: Option<&OperationCancellation>,
+) -> DirectoryScanOutput {
     let mut root = RootSnapshot::new(root_id.clone(), root_path.to_path_buf());
     let started = Instant::now();
     let timeout = options
         .scan_timeout_per_root_millis
         .map(Duration::from_millis);
 
-    if !root_path.exists() {
-        root.status = RootStatus::Missing;
-        root.error = Some(RootError {
-            code: "missing".to_string(),
-            message: "root path does not exist".to_string(),
-        });
-        return DirectoryScanOutput {
-            root,
-            children: Vec::new(),
-            directory_states: DirectoryStateMap::new(),
-            truncated: false,
-        };
+    match root_path.try_exists() {
+        Ok(true) => {}
+        Ok(false) => return empty_root_output(root, RootStatus::Missing, missing_root_error()),
+        Err(error) => {
+            let (status, root_error) = root_io_error(&error, "root_path_check_failed");
+            return empty_root_output(root, status, root_error);
+        }
+    }
+    if let Some((status, root_error)) = root_location_issue(root_path, options) {
+        return empty_root_output(root, status, root_error);
     }
 
     let mut state = FileListWalkState {
@@ -106,25 +121,32 @@ pub fn scan_file_list_root(
         visited_directories: BTreeSet::new(),
         visited_nodes: 0,
         directory_states: DirectoryStateMap::new(),
+        directory_read_errors: BTreeMap::new(),
         truncated: false,
         timed_out: false,
+        cancelled: false,
+        root_error: None,
+        cancellation,
     };
 
-    let root_resolution =
-        resolve_scannable_path(root_path.to_path_buf(), root_path.to_path_buf(), options);
+    let root_resolution = resolve_scannable_path(
+        root_path.to_path_buf(),
+        root_path.to_path_buf(),
+        options,
+        Some(extensions),
+    );
     let root_metadata = match fs::metadata(&root_resolution.resolved_path) {
         Ok(metadata) => metadata,
         Err(error) => {
-            root.status = RootStatus::Missing;
-            root.error = Some(RootError {
-                code: "unresolved_root".to_string(),
-                message: error.to_string(),
-            });
+            let (status, root_error) = root_io_error(&error, "unresolved_root");
+            root.status = status;
+            root.error = Some(root_error);
             return DirectoryScanOutput {
                 root,
                 children: Vec::new(),
                 directory_states: state.directory_states,
                 truncated: state.truncated,
+                change_summary: None,
             };
         }
     };
@@ -139,7 +161,14 @@ pub fn scan_file_list_root(
             children: Vec::new(),
             directory_states: state.directory_states,
             truncated: state.truncated,
+            change_summary: None,
         };
+    }
+
+    if let Some((status, root_error)) =
+        root_content_preflight_issue(&root_resolution.resolved_path, options, extensions)
+    {
+        return empty_root_output(root, status, root_error);
     }
 
     let children = scan_directory(root_path, &root_resolution.resolved_path, 0, &mut state)
@@ -147,17 +176,347 @@ pub fn scan_file_list_root(
     root.item_count = state.visited_nodes;
     root.last_loaded_at = Some(now_timestamp_millis());
     root.is_dirty = false;
-    root.status = if state.timed_out {
-        RootStatus::TimedOut
+    if let Some(error) = state.root_error {
+        root.status = RootStatus::Unreadable;
+        root.error = Some(error);
     } else {
-        RootStatus::Ready
-    };
+        root.status = if state.cancelled {
+            root.error = Some(cancelled_root_error());
+            RootStatus::Cancelled
+        } else if state.timed_out {
+            RootStatus::TimedOut
+        } else {
+            RootStatus::Ready
+        };
+    }
 
     DirectoryScanOutput {
         root,
         children,
         directory_states: state.directory_states,
         truncated: state.truncated,
+        change_summary: None,
+    }
+}
+
+pub fn scan_file_list_root_with_dirty_directories(
+    root_id: &RootId,
+    root_path: &Path,
+    options: &ScannerOptions,
+    extensions: &ExtensionPolicy,
+    previous_snapshot: Option<&FileListSnapshot>,
+    dirty_directories: &[PathBuf],
+) -> DirectoryScanOutput {
+    scan_file_list_root_with_dirty_directories_controlled(
+        root_id,
+        root_path,
+        options,
+        extensions,
+        previous_snapshot,
+        dirty_directories,
+        None,
+    )
+}
+
+pub(crate) fn scan_file_list_root_with_dirty_directories_controlled(
+    root_id: &RootId,
+    root_path: &Path,
+    options: &ScannerOptions,
+    extensions: &ExtensionPolicy,
+    previous_snapshot: Option<&FileListSnapshot>,
+    dirty_directories: &[PathBuf],
+    cancellation: Option<&OperationCancellation>,
+) -> DirectoryScanOutput {
+    let Some(previous_snapshot) = previous_snapshot else {
+        return scan_file_list_root_controlled(
+            root_id,
+            root_path,
+            options,
+            extensions,
+            cancellation,
+        );
+    };
+    let Some(previous_children) = previous_snapshot.children.as_ref() else {
+        return scan_file_list_root_controlled(
+            root_id,
+            root_path,
+            options,
+            extensions,
+            cancellation,
+        );
+    };
+
+    let root_resolution = resolve_scannable_path(
+        root_path.to_path_buf(),
+        root_path.to_path_buf(),
+        options,
+        Some(extensions),
+    );
+    let normalized_root_path = normalize_path(&root_resolution.resolved_path);
+    let dirty_directories = normalize_dirty_directories(dirty_directories, &normalized_root_path);
+    if dirty_directories.is_empty()
+        || dirty_directories
+            .iter()
+            .any(|directory| directory == &normalized_root_path)
+    {
+        return scan_file_list_root_controlled(
+            root_id,
+            root_path,
+            options,
+            extensions,
+            cancellation,
+        );
+    }
+
+    let mut children = previous_children.clone();
+    let mut directory_states = previous_snapshot.directory_states.clone();
+    let mut truncated = previous_snapshot.truncated;
+    let mut timed_out = false;
+    let mut cancelled = false;
+    let mut root_error = None;
+
+    for dirty_directory in &dirty_directories {
+        if !directory_exists_in_entries(&children, dirty_directory) {
+            return scan_file_list_root_controlled(
+                root_id,
+                root_path,
+                options,
+                extensions,
+                cancellation,
+            );
+        }
+
+        match fs::metadata(dirty_directory) {
+            Ok(metadata) if metadata.is_dir() => {
+                let output = scan_file_list_directory(
+                    dirty_directory,
+                    dirty_directory,
+                    relative_depth(&normalized_root_path, dirty_directory),
+                    options,
+                    extensions,
+                    cancellation,
+                );
+                replace_directory_children(
+                    &mut children,
+                    dirty_directory,
+                    output.children,
+                    output.directory_error,
+                );
+                remove_directory_states_under(&mut directory_states, dirty_directory);
+                directory_states.extend(output.directory_states);
+                truncated |= output.truncated;
+                timed_out |= output.timed_out;
+                cancelled |= output.cancelled;
+                if root_error.is_none() {
+                    root_error = output.root_error;
+                }
+            }
+            Ok(_) | Err(_) => {
+                remove_directory_entry(&mut children, dirty_directory);
+                remove_directory_states_under(&mut directory_states, dirty_directory);
+            }
+        }
+    }
+
+    if !options.include_empty_directories {
+        prune_empty_directories(&mut children);
+    }
+    sort_entries(&mut children);
+
+    let mut root = previous_snapshot.root.clone();
+    root.item_count = count_entries(&children);
+    root.last_loaded_at = Some(now_timestamp_millis());
+    root.is_dirty = false;
+    if let Some(error) = root_error {
+        root.status = RootStatus::Unreadable;
+        root.error = Some(error);
+    } else {
+        root.status = if cancelled {
+            root.error = Some(cancelled_root_error());
+            RootStatus::Cancelled
+        } else if timed_out {
+            RootStatus::TimedOut
+        } else {
+            RootStatus::Ready
+        };
+        root.error = None;
+    }
+
+    DirectoryScanOutput {
+        root,
+        children,
+        directory_states,
+        truncated,
+        change_summary: None,
+    }
+}
+
+pub(crate) fn try_scan_file_list_root_with_owned_dirty_directories_controlled(
+    root_path: &Path,
+    options: &ScannerOptions,
+    extensions: &ExtensionPolicy,
+    mut previous_snapshot: FileListSnapshot,
+    dirty_directories: &[PathBuf],
+    cancellation: Option<&OperationCancellation>,
+) -> Result<DirectoryScanOutput, Box<FileListSnapshot>> {
+    let Some(previous_children) = previous_snapshot.children.as_ref() else {
+        return Err(Box::new(previous_snapshot));
+    };
+
+    let root_resolution = resolve_scannable_path(
+        root_path.to_path_buf(),
+        root_path.to_path_buf(),
+        options,
+        Some(extensions),
+    );
+    let normalized_root_path = normalize_path(&root_resolution.resolved_path);
+    let dirty_directories = normalize_dirty_directories(dirty_directories, &normalized_root_path);
+    if dirty_directories.is_empty()
+        || dirty_directories
+            .iter()
+            .any(|directory| directory == &normalized_root_path)
+    {
+        return Err(Box::new(previous_snapshot));
+    }
+    if dirty_directories
+        .iter()
+        .any(|directory| !directory_exists_in_entries(previous_children, directory))
+    {
+        return Err(Box::new(previous_snapshot));
+    }
+
+    let previous_dirty_entries =
+        clone_dirty_directory_entries(previous_children, &dirty_directories);
+    let mut children = previous_snapshot.children.take().unwrap_or_default();
+    let mut directory_states = previous_snapshot.directory_states;
+    let mut truncated = previous_snapshot.truncated;
+    let mut timed_out = false;
+    let mut cancelled = false;
+    let mut root_error = None;
+
+    for dirty_directory in &dirty_directories {
+        match fs::metadata(dirty_directory) {
+            Ok(metadata) if metadata.is_dir() => {
+                let output = scan_file_list_directory(
+                    dirty_directory,
+                    dirty_directory,
+                    relative_depth(&normalized_root_path, dirty_directory),
+                    options,
+                    extensions,
+                    cancellation,
+                );
+                replace_directory_children(
+                    &mut children,
+                    dirty_directory,
+                    output.children,
+                    output.directory_error,
+                );
+                remove_directory_states_under(&mut directory_states, dirty_directory);
+                directory_states.extend(output.directory_states);
+                truncated |= output.truncated;
+                timed_out |= output.timed_out;
+                cancelled |= output.cancelled;
+                if root_error.is_none() {
+                    root_error = output.root_error;
+                }
+            }
+            Ok(_) | Err(_) => {
+                remove_directory_entry(&mut children, dirty_directory);
+                remove_directory_states_under(&mut directory_states, dirty_directory);
+            }
+        }
+    }
+
+    if !options.include_empty_directories {
+        prune_empty_directories(&mut children);
+    }
+    sort_entries(&mut children);
+
+    let current_dirty_entries = clone_dirty_directory_entries(&children, &dirty_directories);
+    let mut root = previous_snapshot.root;
+    let change_summary = diff_file_entry_sets(
+        &root.root_id,
+        &previous_dirty_entries,
+        &current_dirty_entries,
+    );
+    root.item_count = count_entries(&children);
+    root.last_loaded_at = Some(now_timestamp_millis());
+    root.is_dirty = false;
+    if let Some(error) = root_error {
+        root.status = RootStatus::Unreadable;
+        root.error = Some(error);
+    } else {
+        root.status = if cancelled {
+            root.error = Some(cancelled_root_error());
+            RootStatus::Cancelled
+        } else if timed_out {
+            RootStatus::TimedOut
+        } else {
+            RootStatus::Ready
+        };
+        root.error = None;
+    }
+
+    Ok(DirectoryScanOutput {
+        root,
+        children,
+        directory_states,
+        truncated,
+        change_summary: Some(change_summary),
+    })
+}
+
+#[derive(Debug)]
+struct PartialDirectoryScanOutput {
+    children: Vec<FileSystemEntry>,
+    directory_states: DirectoryStateMap,
+    directory_error: Option<(PathResolutionStatus, String)>,
+    truncated: bool,
+    timed_out: bool,
+    cancelled: bool,
+    root_error: Option<RootError>,
+}
+
+fn scan_file_list_directory(
+    display_directory: &Path,
+    source_directory: &Path,
+    depth: usize,
+    options: &ScannerOptions,
+    extensions: &ExtensionPolicy,
+    cancellation: Option<&OperationCancellation>,
+) -> PartialDirectoryScanOutput {
+    let mut state = FileListWalkState {
+        options,
+        extensions,
+        timeout: options
+            .scan_timeout_per_root_millis
+            .map(Duration::from_millis),
+        started: Instant::now(),
+        visited_directories: BTreeSet::new(),
+        visited_nodes: 0,
+        directory_states: DirectoryStateMap::new(),
+        directory_read_errors: BTreeMap::new(),
+        truncated: false,
+        timed_out: false,
+        cancelled: false,
+        root_error: None,
+        cancellation,
+    };
+    let resolved_directory = normalize_path(source_directory);
+    let children =
+        scan_directory(display_directory, source_directory, depth, &mut state).unwrap_or_default();
+    let directory_error = state
+        .directory_read_errors
+        .get(&resolved_directory)
+        .cloned();
+    PartialDirectoryScanOutput {
+        children,
+        directory_states: state.directory_states,
+        directory_error,
+        truncated: state.truncated,
+        timed_out: state.timed_out,
+        cancelled: state.cancelled,
+        root_error: state.root_error,
     }
 }
 
@@ -169,8 +528,12 @@ struct FileListWalkState<'a> {
     visited_directories: BTreeSet<PathBuf>,
     visited_nodes: usize,
     directory_states: DirectoryStateMap,
+    directory_read_errors: BTreeMap<PathBuf, (PathResolutionStatus, String)>,
     truncated: bool,
     timed_out: bool,
+    cancelled: bool,
+    root_error: Option<RootError>,
+    cancellation: Option<&'a OperationCancellation>,
 }
 
 fn scan_directory(
@@ -190,7 +553,17 @@ fn scan_directory(
 
     let entries = match fs::read_dir(source_directory) {
         Ok(entries) => entries,
-        Err(_) => return Some(Vec::new()),
+        Err(error) => {
+            state.directory_read_errors.insert(
+                resolved_directory,
+                (path_error_status(&error), error.to_string()),
+            );
+            if depth == 0 {
+                let (_, root_error) = root_io_error(&error, "read_directory_failed");
+                state.root_error = Some(root_error);
+            }
+            return Some(Vec::new());
+        }
     };
 
     let mut children = Vec::new();
@@ -205,7 +578,12 @@ fn scan_directory(
             continue;
         }
 
-        let resolved = resolve_scannable_path(display_path, source_path, state.options);
+        let resolved = resolve_scannable_path(
+            display_path,
+            source_path,
+            state.options,
+            Some(state.extensions),
+        );
         if should_include_resolution_error(&resolved) {
             children.push(resolution_error_entry(resolved));
             state.visited_nodes += 1;
@@ -218,15 +596,27 @@ fn scan_directory(
         let metadata = match fs::metadata(&resolved.resolved_path) {
             Ok(metadata) => metadata,
             Err(error) => {
-                if should_include_resolution_error(&resolved) {
+                let status = path_error_status(&error);
+                if should_include_resolution_error(&resolved)
+                    || should_include_metadata_error(&resolved, status, state.extensions)
+                {
                     children.push(resolution_error_entry(
-                        resolved.with_status(path_error_status(&error), Some(error.to_string())),
+                        resolved.with_status(status, Some(error.to_string())),
                     ));
                     state.visited_nodes += 1;
                 }
                 continue;
             }
         };
+
+        if is_script_package_path(&resolved.display_path)
+            || is_script_package_path(&resolved.resolved_path)
+        {
+            let identity = file_identity(&resolved.resolved_path, &metadata);
+            children.push(script_package_entry(resolved, &metadata, identity));
+            state.visited_nodes += 1;
+            continue;
+        }
 
         if metadata.is_dir() {
             let resolved_directory = normalize_path(&resolved.resolved_path);
@@ -247,12 +637,23 @@ fn scan_directory(
                     state,
                 )
                 .unwrap_or_default();
-                (resolved, nested_children)
+                let resolved_directory = normalize_path(&resolved.resolved_path);
+                if let Some((status, message)) =
+                    state.directory_read_errors.get(&resolved_directory)
+                {
+                    let resolved = resolved.with_status(*status, Some(message.clone()));
+                    (resolved, nested_children)
+                } else {
+                    (resolved, nested_children)
+                }
             };
             if state.options.include_empty_directories
                 || !nested_children.is_empty()
                 || resolved.resolution_status == PathResolutionStatus::Cycle
+                || resolved.resolution_status == PathResolutionStatus::PermissionDenied
+                || resolved.resolution_status == PathResolutionStatus::Broken
             {
+                let identity = file_identity(&resolved.resolved_path, &metadata);
                 children.push(FileSystemEntry {
                     display_path: resolved.display_path,
                     resolved_path: resolved.resolved_path,
@@ -262,6 +663,7 @@ fn scan_directory(
                     is_directory: true,
                     file_size: None,
                     content_modified_at: None,
+                    identity,
                     runtime_kind: None,
                     shebang: None,
                     has_scriptmeta: false,
@@ -280,6 +682,7 @@ fn scan_directory(
 
         if metadata.is_file() && state.extensions.contains_path(&resolved.resolved_path) {
             let file_info = detect_script_info_for_file_list(&resolved.resolved_path);
+            let identity = file_identity(&resolved.resolved_path, &metadata);
             children.push(FileSystemEntry {
                 display_path: resolved.display_path,
                 resolved_path: resolved.resolved_path,
@@ -289,6 +692,7 @@ fn scan_directory(
                 is_directory: false,
                 file_size: Some(metadata.len()),
                 content_modified_at: metadata.modified().ok().and_then(system_time_millis),
+                identity,
                 runtime_kind: file_info.script.runtime_kind,
                 shebang: file_info.script.shebang,
                 has_scriptmeta: file_info.capability.has_scriptmeta,
@@ -317,6 +721,9 @@ fn scan_directory(
             modification_time_millis: modification_time_millis(source_directory),
             child_count: children.len(),
             child_fingerprint: fingerprint,
+            identity: fs::metadata(source_directory)
+                .ok()
+                .and_then(|metadata| file_identity(source_directory, &metadata)),
         },
     );
 
@@ -324,6 +731,14 @@ fn scan_directory(
 }
 
 fn should_stop(depth: usize, state: &mut FileListWalkState<'_>) -> bool {
+    if state
+        .cancellation
+        .is_some_and(OperationCancellation::is_cancelled)
+    {
+        state.cancelled = true;
+        return true;
+    }
+
     if depth > state.options.max_depth || state.visited_nodes >= state.options.max_nodes_per_root {
         state.truncated = true;
         return true;
@@ -354,6 +769,15 @@ fn should_include_resolution_error(resolved: &ResolvedPath) -> bool {
         && resolved.resolution_status != PathResolutionStatus::Resolved
 }
 
+fn should_include_metadata_error(
+    resolved: &ResolvedPath,
+    status: PathResolutionStatus,
+    extensions: &ExtensionPolicy,
+) -> bool {
+    status == PathResolutionStatus::PermissionDenied
+        && extensions.contains_path(&resolved.resolved_path)
+}
+
 fn resolution_error_entry(resolved: ResolvedPath) -> FileSystemEntry {
     FileSystemEntry {
         display_path: resolved.display_path,
@@ -364,6 +788,7 @@ fn resolution_error_entry(resolved: ResolvedPath) -> FileSystemEntry {
         is_directory: false,
         file_size: None,
         content_modified_at: None,
+        identity: None,
         runtime_kind: None,
         shebang: None,
         has_scriptmeta: false,
@@ -377,11 +802,326 @@ fn resolution_error_entry(resolved: ResolvedPath) -> FileSystemEntry {
     }
 }
 
+fn script_package_entry(
+    resolved: ResolvedPath,
+    metadata: &fs::Metadata,
+    identity: Option<FileIdentity>,
+) -> FileSystemEntry {
+    FileSystemEntry {
+        display_path: resolved.display_path,
+        resolved_path: resolved.resolved_path,
+        path_kind: resolved.path_kind,
+        resolution_status: resolved.resolution_status,
+        resolution_message: resolved.resolution_message,
+        is_directory: false,
+        file_size: None,
+        content_modified_at: metadata.modified().ok().and_then(system_time_millis),
+        identity,
+        runtime_kind: Some(ScriptRuntimeKind::AppleScript),
+        shebang: None,
+        has_scriptmeta: false,
+        has_scriptmeta_edit_password: false,
+        is_file_locked: false,
+        is_read_only: false,
+        can_edit_scriptmeta: false,
+        can_append_scriptmeta: false,
+        scriptmeta_edit_state: crate::core::ScriptMetaEditState::Unsupported,
+        children: Vec::new(),
+    }
+}
+
+fn empty_root_output(
+    mut root: RootSnapshot,
+    status: RootStatus,
+    error: RootError,
+) -> DirectoryScanOutput {
+    root.status = status;
+    root.error = Some(error);
+    DirectoryScanOutput {
+        root,
+        children: Vec::new(),
+        directory_states: DirectoryStateMap::new(),
+        truncated: false,
+        change_summary: None,
+    }
+}
+
+fn missing_root_error() -> RootError {
+    RootError {
+        code: "missing".to_string(),
+        message: "root path does not exist".to_string(),
+    }
+}
+
+fn cancelled_root_error() -> RootError {
+    RootError {
+        code: "operation_cancelled".to_string(),
+        message: "operation was cancelled".to_string(),
+    }
+}
+
+fn root_io_error(error: &io::Error, fallback_code: &'static str) -> (RootStatus, RootError) {
+    let (status, code) = match error.kind() {
+        io::ErrorKind::NotFound => (RootStatus::Missing, "missing"),
+        io::ErrorKind::PermissionDenied => (RootStatus::Unreadable, "permission_denied"),
+        _ => (RootStatus::Unreadable, fallback_code),
+    };
+    (
+        status,
+        RootError {
+            code: code.to_string(),
+            message: error.to_string(),
+        },
+    )
+}
+
 fn is_package_path(path: &Path) -> bool {
     matches!(
         path.extension().and_then(|extension| extension.to_str()),
         Some("app" | "bundle" | "framework" | "plugin" | "appex")
     )
+}
+
+fn is_script_package_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("scptd"))
+}
+
+fn normalize_dirty_directories(directories: &[PathBuf], root_path: &Path) -> Vec<PathBuf> {
+    let mut normalized = directories
+        .iter()
+        .map(|directory| normalize_path(directory))
+        .filter(|directory| path_is_same_or_child(directory, root_path))
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    prune_redundant_dirty_directories(normalized)
+}
+
+fn prune_redundant_dirty_directories(directories: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut pruned: Vec<PathBuf> = Vec::with_capacity(directories.len());
+    for directory in directories {
+        if pruned
+            .iter()
+            .any(|parent| path_is_same_or_child(&directory, parent))
+        {
+            continue;
+        }
+        pruned.push(directory);
+    }
+    pruned
+}
+
+fn directory_exists_in_entries(entries: &[FileSystemEntry], directory: &Path) -> bool {
+    entries.iter().any(|entry| {
+        entry.is_directory
+            && (entry.resolved_path == directory
+                || directory_exists_in_entries(&entry.children, directory))
+    })
+}
+
+fn clone_dirty_directory_entries(
+    entries: &[FileSystemEntry],
+    dirty_directories: &[PathBuf],
+) -> Vec<FileSystemEntry> {
+    dirty_directories
+        .iter()
+        .filter_map(|directory| find_directory_entry(entries, directory).cloned())
+        .collect()
+}
+
+fn find_directory_entry<'a>(
+    entries: &'a [FileSystemEntry],
+    directory: &Path,
+) -> Option<&'a FileSystemEntry> {
+    for entry in entries {
+        if entry.is_directory && entry.resolved_path == directory {
+            return Some(entry);
+        }
+        if let Some(found) = find_directory_entry(&entry.children, directory) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn replace_directory_children(
+    entries: &mut [FileSystemEntry],
+    directory: &Path,
+    children: Vec<FileSystemEntry>,
+    directory_error: Option<(PathResolutionStatus, String)>,
+) -> bool {
+    let mut children = Some(children);
+    replace_directory_children_inner(entries, directory, &mut children, directory_error.as_ref())
+}
+
+fn replace_directory_children_inner(
+    entries: &mut [FileSystemEntry],
+    directory: &Path,
+    children: &mut Option<Vec<FileSystemEntry>>,
+    directory_error: Option<&(PathResolutionStatus, String)>,
+) -> bool {
+    for entry in entries {
+        if entry.is_directory && entry.resolved_path == directory {
+            entry.children = children.take().unwrap_or_default();
+            if let Some((status, message)) = directory_error {
+                entry.resolution_status = *status;
+                entry.resolution_message = Some(message.clone());
+            } else if matches!(
+                entry.resolution_status,
+                PathResolutionStatus::PermissionDenied | PathResolutionStatus::Broken
+            ) {
+                entry.resolution_status = PathResolutionStatus::Resolved;
+                entry.resolution_message = None;
+            }
+            return true;
+        }
+        if replace_directory_children_inner(
+            &mut entry.children,
+            directory,
+            children,
+            directory_error,
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+fn remove_directory_entry(entries: &mut Vec<FileSystemEntry>, directory: &Path) -> bool {
+    let original_len = entries.len();
+    entries.retain(|entry| !(entry.is_directory && entry.resolved_path == directory));
+    if entries.len() != original_len {
+        return true;
+    }
+    entries
+        .iter_mut()
+        .any(|entry| remove_directory_entry(&mut entry.children, directory))
+}
+
+fn prune_empty_directories(entries: &mut Vec<FileSystemEntry>) {
+    for entry in entries.iter_mut() {
+        prune_empty_directories(&mut entry.children);
+    }
+    entries.retain(|entry| {
+        !entry.is_directory
+            || !entry.children.is_empty()
+            || entry.resolution_status == PathResolutionStatus::Cycle
+            || entry.resolution_status == PathResolutionStatus::PermissionDenied
+            || entry.resolution_status == PathResolutionStatus::Broken
+    });
+}
+
+fn sort_entries(entries: &mut [FileSystemEntry]) {
+    for entry in entries.iter_mut() {
+        sort_entries(&mut entry.children);
+    }
+    entries.sort_by(|lhs, rhs| {
+        rhs.is_directory
+            .cmp(&lhs.is_directory)
+            .then_with(|| display_name(&lhs.display_path).cmp(&display_name(&rhs.display_path)))
+    });
+}
+
+fn remove_directory_states_under(states: &mut DirectoryStateMap, directory: &Path) {
+    states.retain(|key, _| !path_is_same_or_child(Path::new(key), directory));
+}
+
+fn count_entries(entries: &[FileSystemEntry]) -> usize {
+    entries
+        .iter()
+        .map(|entry| 1usize.saturating_add(count_entries(&entry.children)))
+        .sum()
+}
+
+fn diff_file_entry_sets(
+    root_id: &RootId,
+    previous_entries: &[FileSystemEntry],
+    current_entries: &[FileSystemEntry],
+) -> ScanChangeSummary {
+    let mut previous_map = BTreeMap::new();
+    let mut current_map = BTreeMap::new();
+    collect_file_entries(previous_entries, &mut previous_map);
+    collect_file_entries(current_entries, &mut current_map);
+
+    let mut summary = ScanChangeSummary::default();
+    for (path, current_entry) in &current_map {
+        match previous_map.get(path) {
+            Some(previous_entry) if file_entry_changed(previous_entry, current_entry) => {
+                summary.modified_count += 1;
+                summary.changes.push(FileEntryChange::from_entry(
+                    root_id.clone(),
+                    FileEntryChangeKind::Modified,
+                    current_entry,
+                ));
+            }
+            Some(_) => {}
+            None => {
+                summary.added_count += 1;
+                summary.changes.push(FileEntryChange::from_entry(
+                    root_id.clone(),
+                    FileEntryChangeKind::Added,
+                    current_entry,
+                ));
+            }
+        }
+    }
+
+    for (path, previous_entry) in &previous_map {
+        if current_map.contains_key(path) {
+            continue;
+        }
+        summary.removed_count += 1;
+        summary.changes.push(FileEntryChange::from_entry(
+            root_id.clone(),
+            FileEntryChangeKind::Removed,
+            previous_entry,
+        ));
+    }
+    summary
+        .changes
+        .sort_by(|lhs, rhs| lhs.resolved_path.cmp(&rhs.resolved_path));
+    summary
+}
+
+fn collect_file_entries<'a>(
+    entries: &'a [FileSystemEntry],
+    output: &mut BTreeMap<&'a Path, &'a FileSystemEntry>,
+) {
+    for entry in entries {
+        output.insert(entry.resolved_path.as_path(), entry);
+        collect_file_entries(&entry.children, output);
+    }
+}
+
+fn file_entry_changed(lhs: &FileSystemEntry, rhs: &FileSystemEntry) -> bool {
+    lhs.is_directory != rhs.is_directory
+        || lhs.path_kind != rhs.path_kind
+        || lhs.resolution_status != rhs.resolution_status
+        || lhs.resolution_message.as_deref() != rhs.resolution_message.as_deref()
+        || lhs.file_size != rhs.file_size
+        || lhs.content_modified_at != rhs.content_modified_at
+        || lhs.identity != rhs.identity
+        || lhs.runtime_kind != rhs.runtime_kind
+        || lhs.shebang.as_deref() != rhs.shebang.as_deref()
+        || lhs.has_scriptmeta != rhs.has_scriptmeta
+        || lhs.has_scriptmeta_edit_password != rhs.has_scriptmeta_edit_password
+        || lhs.is_file_locked != rhs.is_file_locked
+        || lhs.is_read_only != rhs.is_read_only
+        || lhs.can_edit_scriptmeta != rhs.can_edit_scriptmeta
+        || lhs.can_append_scriptmeta != rhs.can_append_scriptmeta
+        || lhs.scriptmeta_edit_state != rhs.scriptmeta_edit_state
+}
+
+fn relative_depth(root_path: &Path, path: &Path) -> usize {
+    path.strip_prefix(root_path)
+        .map(|relative| relative.components().count())
+        .unwrap_or(0)
+}
+
+fn path_is_same_or_child(path: &Path, parent: &Path) -> bool {
+    path == parent || path.starts_with(parent)
 }
 
 fn display_name(path: &Path) -> Cow<'_, str> {
@@ -437,6 +1177,42 @@ fn modification_time_millis(path: &Path) -> Option<u64> {
         .ok()
         .and_then(|metadata| metadata.modified().ok())
         .and_then(system_time_millis)
+}
+
+pub(crate) fn file_identity(path: &Path, metadata: &fs::Metadata) -> Option<FileIdentity> {
+    let content_modified_at = metadata.modified().ok().and_then(system_time_millis);
+    let (volume_id, file_id) = platform_file_identity(metadata);
+    let stable_id = match (&volume_id, &file_id) {
+        (Some(volume_id), Some(file_id)) => format!("{volume_id}:{file_id}"),
+        _ => format!(
+            "path:{}:{}:{}",
+            normalize_path(path).to_string_lossy(),
+            metadata.len(),
+            content_modified_at.unwrap_or_default()
+        ),
+    };
+    Some(FileIdentity {
+        stable_id,
+        volume_id,
+        file_id,
+        file_size: Some(metadata.len()),
+        content_modified_at,
+    })
+}
+
+#[cfg(unix)]
+fn platform_file_identity(metadata: &fs::Metadata) -> (Option<String>, Option<String>) {
+    use std::os::unix::fs::MetadataExt;
+
+    (
+        Some(metadata.dev().to_string()),
+        Some(metadata.ino().to_string()),
+    )
+}
+
+#[cfg(not(unix))]
+fn platform_file_identity(_metadata: &fs::Metadata) -> (Option<String>, Option<String>) {
+    (None, None)
 }
 
 pub(crate) fn system_time_millis(time: SystemTime) -> Option<u64> {

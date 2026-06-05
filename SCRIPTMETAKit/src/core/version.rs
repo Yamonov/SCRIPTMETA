@@ -8,6 +8,46 @@ pub enum VersionOrdering {
 }
 
 #[must_use]
+pub fn normalize_version_string(value: &str) -> Option<String> {
+    let compact = value
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    let bytes = compact.as_bytes();
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        if !bytes[index].is_ascii_digit() {
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        index += 1;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+
+        let mut end = index;
+        while index < bytes.len() && bytes[index] == b'.' {
+            index += 1;
+            let component_start = index;
+            while index < bytes.len() && bytes[index].is_ascii_digit() {
+                index += 1;
+            }
+            if component_start == index {
+                break;
+            }
+            end = index;
+        }
+
+        return Some(compact[start..end].to_string());
+    }
+
+    None
+}
+
+#[must_use]
 pub fn compare_versions(lhs: &str, rhs: &str) -> VersionOrdering {
     match compare_segments(lhs, rhs) {
         Ordering::Less => VersionOrdering::Less,
@@ -134,7 +174,24 @@ const fn to_ascii_lowercase(byte: u8) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{VersionOrdering, compare_versions};
+    use super::{VersionOrdering, compare_versions, normalize_version_string};
+
+    #[test]
+    fn normalizes_scripta_style_versions() {
+        assert_eq!(
+            normalize_version_string("v1.2.3"),
+            Some("1.2.3".to_string())
+        );
+        assert_eq!(
+            normalize_version_string(" 1. 2 .3 "),
+            Some("1.2.3".to_string())
+        );
+        assert_eq!(
+            normalize_version_string("build 12 beta"),
+            Some("12".to_string())
+        );
+        assert_eq!(normalize_version_string("version x"), None);
+    }
 
     #[test]
     fn compares_versions_without_segment_allocation() {

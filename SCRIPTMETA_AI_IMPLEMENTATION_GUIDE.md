@@ -198,6 +198,11 @@ In a `SCRIPTMETA-DIST-BEGIN ... SCRIPTMETA-DIST-END` block:
 - Write `Version` when this page contains the latest metadata.
 - Write `Latest-URL` only when this page redirects update checking to another
   SCRIPTMETA information page.
+- Do not write script-display or editor-only fields in a distribution record:
+  `Name`, `Author`, `Description`, `Target-App`, `Min-Target-Version`,
+  `Release-Date`, or `Edit-Password-SHA256`.
+- Do not write `Note`. Notes are client-side diagnostics, not a SCRIPTMETA
+  field.
 - Do not write `Meta-URL` in a distribution record. `Meta-URL` is a script-side
   key.
 - Do not write `URL`, `Page-URL`, `Self-URL`, `Distribution-URL`, or similar
