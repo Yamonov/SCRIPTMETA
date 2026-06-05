@@ -59,7 +59,7 @@ pub use watcher::{
     WatchRescanReason, WatchRescanTarget,
 };
 
-pub type RootId = String;
+pub type RootId = std::sync::Arc<str>;
 pub type ItemId = String;
 pub type TimestampMillis = u64;
 

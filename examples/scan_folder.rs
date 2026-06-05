@@ -73,13 +73,13 @@ fn run(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         if update_result.statuses_by_item_id.is_empty() {
             println!("No update-checkable items.");
         }
-        for (item_id, status) in update_result.statuses_by_item_id {
+        for (item_id, status) in &update_result.statuses_by_item_id {
             let latest_version = update_result
                 .resolutions_by_item_id
-                .get(&item_id)
+                .get(item_id)
                 .and_then(|resolution| resolution.latest_version.as_deref())
                 .unwrap_or("-");
-            let failure = update_result.failures_by_item_id.get(&item_id);
+            let failure = update_result.failures_by_item_id.get(item_id);
             if let Some(failure) = failure {
                 println!(
                     "- {item_id}: {status:?}, latest={latest_version}, error={} ({})",

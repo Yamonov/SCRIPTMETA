@@ -12,7 +12,7 @@ use std::{
 use scriptmetakit::{
     CachePolicy, DistributionMetadataDraft as KitDistributionMetadataDraft, DistributionResolution,
     FileEntryChange, FileEntryChangeKind, FileIdentity, FileIssue, FileListSnapshot,
-    FileSystemEntry, IgnoredWatchPath, OperationSummary, RefreshPolicy, RootChangeBatch,
+    FileSystemEntry, IgnoredWatchPath, OperationSummary, RefreshPolicy, RootChangeBatch, RootId,
     RootPriority, RootPurpose, RootRegistration, RootSnapshot, RootStatus, ScanChangeSummary,
     ScanMode, ScanRequest, ScanResult, ScriptMetaBackupGeneration as KitScriptMetaBackupGeneration,
     ScriptMetaBackupOptions, ScriptMetaBackupReason,
@@ -958,7 +958,7 @@ pub unsafe extern "C" fn smk_engine_set_visible_root(
         let root_id = if has_root_id == 0 {
             None
         } else {
-            Some(required_str_from_slice(root_id, "root_id")?.to_string())
+            Some(required_str_from_slice(root_id, "root_id")?.into())
         };
         engine.engine.set_visible_root(root_id);
         Ok(())
@@ -1181,7 +1181,8 @@ pub unsafe extern "C" fn smk_engine_check_update_item(
 
         match pollster::block_on(engine.engine.check_update_for_item(item)) {
             Ok(result) => {
-                *out_result = Box::into_raw(Box::new(SmkScanResult::from_update_result(result)));
+                *out_result =
+                    Box::into_raw(Box::new(SmkScanResult::from_update_result(result.as_ref())));
                 Ok(())
             }
             Err(error) => {
@@ -1226,7 +1227,8 @@ pub unsafe extern "C" fn smk_engine_check_update_item_with_progress(
                 }),
         ) {
             Ok(result) => {
-                *out_result = Box::into_raw(Box::new(SmkScanResult::from_update_result(result)));
+                *out_result =
+                    Box::into_raw(Box::new(SmkScanResult::from_update_result(result.as_ref())));
                 Ok(())
             }
             Err(error) => {
@@ -2362,7 +2364,7 @@ fn scan_folders(
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| folder.display().to_string());
             RootRegistration {
-                root_id,
+                root_id: root_id.into(),
                 path: folder,
                 display_name: Some(display_name),
                 purpose: RootPurpose::FileListAndMetadata,
@@ -2420,7 +2422,7 @@ fn scan_registered_roots(
 
 fn scan_selected_roots(
     engine: &mut ScriptMetaKitEngine,
-    root_ids: Vec<String>,
+    root_ids: Vec<RootId>,
     scan_mode: ScanMode,
     check_updates: bool,
     progress_callback: SmkUpdateProgressCallback,
@@ -2535,14 +2537,18 @@ fn poll_watcher_scan(_engine: &mut SmkEngine) -> Result<Option<SmkScanResult>, S
 }
 
 impl SmkScanResult {
-    fn from_scan_result(scan_result: ScanResult, update_result: Option<UpdateCheckResult>) -> Self {
-        let update_result =
-            update_result.or_else(|| scan_result.update_check_result.as_ref().cloned());
+    fn from_scan_result(
+        scan_result: ScanResult,
+        update_result: Option<Arc<UpdateCheckResult>>,
+    ) -> Self {
+        let update_result = update_result
+            .as_deref()
+            .or(scan_result.update_check_result.as_deref());
         let operation = update_result
             .as_ref()
             .map(|result| &result.operation)
             .unwrap_or(&scan_result.operation);
-        let string_capacity = total_string_bytes(&scan_result, update_result.as_ref());
+        let string_capacity = total_string_bytes(&scan_result, update_result);
         let file_entry_capacity = total_file_entry_count(&scan_result);
         let mut result = Self {
             string_storage: Vec::with_capacity(string_capacity),
@@ -2583,7 +2589,7 @@ impl SmkScanResult {
             .roots
             .iter()
             .enumerate()
-            .map(|(index, root)| (root.root_id.as_str(), index))
+            .map(|(index, root)| (root.root_id.as_ref(), index))
             .collect();
         for root in &scan_result.roots {
             result.push_root(root);
@@ -2623,16 +2629,16 @@ impl SmkScanResult {
         }
 
         if let Some(update_result) = update_result {
-            result.push_update_result(&update_result);
+            result.push_update_result(update_result);
         }
 
         result.string_index.clear();
         result
     }
 
-    fn from_update_result(update_result: UpdateCheckResult) -> Self {
+    fn from_update_result(update_result: &UpdateCheckResult) -> Self {
         let mut result = Self {
-            string_storage: Vec::with_capacity(update_result_string_bytes(&update_result)),
+            string_storage: Vec::with_capacity(update_result_string_bytes(update_result)),
             string_index: BTreeMap::new(),
             roots: Vec::new(),
             file_lists: Vec::new(),
@@ -2656,7 +2662,7 @@ impl SmkScanResult {
             watch_rescan_targets: Vec::new(),
         };
         result.push_operation_info(&update_result.operation);
-        result.push_update_result(&update_result);
+        result.push_update_result(update_result);
         result.string_index.clear();
         result
     }
@@ -2665,7 +2671,7 @@ impl SmkScanResult {
         let (has_last_loaded_at, last_loaded_at) = optional_u64(root.last_loaded_at);
         let (has_last_event_at, last_event_at) = optional_u64(root.last_event_at);
         let ffi_root = SmkRootSnapshot {
-            root_id: self.push_string(Some(root.root_id.as_str())),
+            root_id: self.push_string(Some(root.root_id.as_ref())),
             path: self.push_path(&root.path),
             status: static_slice(root_status(root.status)),
             is_dirty: bool_byte(root.is_dirty),
@@ -2719,7 +2725,7 @@ impl SmkScanResult {
             .as_ref()
             .map_or(0, |children| self.push_file_entries(children));
         let root_index = root_indices
-            .get(snapshot.root.root_id.as_str())
+            .get(snapshot.root.root_id.as_ref())
             .copied()
             .unwrap_or(usize::MAX);
         self.file_lists.push(SmkFileListSnapshot {
@@ -2789,7 +2795,7 @@ impl SmkScanResult {
 
     fn script_item(&mut self, item: &ScriptMetaItem) -> SmkScriptItem {
         SmkScriptItem {
-            root_id: self.push_string(Some(item.root_id.as_str())),
+            root_id: self.push_string(Some(item.root_id.as_ref())),
             file_path: self.push_path(&item.file_path),
             identity_path: self.push_path(&item.identity_path),
             runtime_kind: item.runtime_kind.map_or_else(SmkUtf8Slice::empty, |kind| {
@@ -2831,7 +2837,7 @@ impl SmkScanResult {
 
     fn push_file_entry_change(&mut self, change: &FileEntryChange) {
         let entry = SmkFileEntryChange {
-            root_id: self.push_string(Some(change.root_id.as_str())),
+            root_id: self.push_string(Some(change.root_id.as_ref())),
             kind: static_slice(file_entry_change_kind(change.kind)),
             display_path: self.push_path(&change.display_path),
             resolved_path: self.push_path(&change.resolved_path),
@@ -2906,7 +2912,7 @@ impl SmkScanResult {
 
     fn watch_event(&mut self, event: &WatchPathEvent) -> SmkWatchPathEvent {
         SmkWatchPathEvent {
-            root_id: self.push_string(Some(event.root_id.as_str())),
+            root_id: self.push_string(Some(event.root_id.as_ref())),
             path: self.push_path(&event.path),
             kind: static_slice(watch_path_event_kind(event.kind)),
             is_directory: bool_byte(event.is_directory),
@@ -2928,7 +2934,7 @@ impl SmkScanResult {
         candidate: &WatchRenameCandidate,
     ) -> SmkWatchRenameCandidate {
         SmkWatchRenameCandidate {
-            root_id: self.push_string(Some(candidate.root_id.as_str())),
+            root_id: self.push_string(Some(candidate.root_id.as_ref())),
             old_path: self.push_path(&candidate.old_path),
             new_path: self.push_path(&candidate.new_path),
             confidence: static_slice(watch_rename_confidence(candidate.confidence)),
@@ -2937,7 +2943,7 @@ impl SmkScanResult {
 
     fn watch_rescan_target(&mut self, target: &WatchRescanTarget) -> SmkWatchRescanTarget {
         SmkWatchRescanTarget {
-            root_id: self.push_string(Some(target.root_id.as_str())),
+            root_id: self.push_string(Some(target.root_id.as_ref())),
             path: self.push_path(&target.path),
             reason: static_slice(watch_rescan_reason(target.reason)),
         }
@@ -3761,7 +3767,7 @@ fn root_registrations_from_raw(
 fn root_ids_from_raw(
     ptr: *const SmkUtf8Slice,
     len: usize,
-) -> Result<Vec<String>, (SmkStatus, String)> {
+) -> Result<Vec<RootId>, (SmkStatus, String)> {
     if len == 0 {
         return Ok(Vec::new());
     }
@@ -3772,7 +3778,7 @@ fn root_ids_from_raw(
     let root_ids = unsafe { slice::from_raw_parts(ptr, len) };
     root_ids
         .iter()
-        .map(|root_id| required_str_from_slice(*root_id, "root_id").map(ToOwned::to_owned))
+        .map(|root_id| required_str_from_slice(*root_id, "root_id").map(RootId::from))
         .collect::<Result<Vec<_>, _>>()
 }
 
@@ -3780,7 +3786,7 @@ fn root_registration_from_ffi(
     root: &SmkRootRegistration,
 ) -> Result<RootRegistration, (SmkStatus, String)> {
     Ok(RootRegistration {
-        root_id: required_str_from_slice(root.root_id, "root_id")?.to_string(),
+        root_id: required_str_from_slice(root.root_id, "root_id")?.into(),
         path: required_path_from_slice(root.path, "root path")?,
         display_name: optional_string_from_slice(root.display_name)?,
         purpose: root_purpose_from_u32(root.purpose)?,
@@ -3871,7 +3877,7 @@ fn script_item_from_ffi(item: &SmkScriptItem) -> Result<ScriptMetaItem, (SmkStat
     let identity_path =
         optional_path_from_slice(item.identity_path)?.unwrap_or_else(|| file_path.clone());
     Ok(ScriptMetaItem {
-        root_id: required_str_from_slice(item.root_id, "root_id")?.to_string(),
+        root_id: required_str_from_slice(item.root_id, "root_id")?.into(),
         file_path,
         identity_path,
         runtime_kind: optional_script_runtime_kind_from_slice(item.runtime_kind)?,

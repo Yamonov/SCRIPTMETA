@@ -138,7 +138,7 @@ pub fn cache_root_signatures(roots: &[RootRegistration]) -> Vec<CacheRootSignatu
     let mut signatures = roots
         .iter()
         .map(|root| CacheRootSignature {
-            root_id: root.root_id.clone(),
+            root_id: root.root_id.to_string(),
             path: root.path.to_string_lossy().into_owned(),
         })
         .collect::<Vec<_>>();
