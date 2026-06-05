@@ -73,7 +73,7 @@ pub struct RegisteredRootSignature {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CandidateRecord {
     pub root_id: RootId,
-    pub root_path: PathBuf,
+    pub root_path: Arc<PathBuf>,
     pub file_path: PathBuf,
     pub identity_path: PathBuf,
     #[serde(default)]
@@ -316,6 +316,7 @@ fn scan_metadata_root<'a>(
 
     let mut state = MetadataWalkState {
         root,
+        root_path: Arc::new(root.path.clone()),
         options,
         extensions,
         reusable_records,
@@ -506,6 +507,7 @@ fn metadata_scan_parallelism(job_count: usize) -> usize {
 
 struct MetadataWalkState<'a> {
     root: &'a RootRegistration,
+    root_path: Arc<PathBuf>,
     options: &'a ScannerOptions,
     extensions: &'a ExtensionPolicy,
     reusable_records: &'a BTreeMap<&'a Path, &'a CandidateRecord>,
@@ -693,7 +695,7 @@ fn candidate_record(
         );
         return CandidateRecord {
             root_id: state.root.root_id.clone(),
-            root_path: state.root.path.clone(),
+            root_path: Arc::clone(&state.root_path),
             file_path: file_path.to_path_buf(),
             identity_path: identity_path.to_path_buf(),
             path_kind,
@@ -800,7 +802,7 @@ fn candidate_record(
 
     CandidateRecord {
         root_id: state.root.root_id.clone(),
-        root_path: state.root.path.clone(),
+        root_path: Arc::clone(&state.root_path),
         file_path: file_path.to_path_buf(),
         identity_path: identity_path.to_path_buf(),
         path_kind,
@@ -832,7 +834,7 @@ fn candidate_error_record(
 ) -> CandidateRecord {
     CandidateRecord {
         root_id: state.root.root_id.clone(),
-        root_path: state.root.path.clone(),
+        root_path: Arc::clone(&state.root_path),
         file_path: file_path.to_path_buf(),
         identity_path: identity_path.to_path_buf(),
         path_kind,

@@ -46,7 +46,7 @@ pub struct ScriptMetaKitEngine {
     root_snapshots: BTreeMap<RootId, RootSnapshot>,
     file_list_snapshots: BTreeMap<RootId, Arc<FileListSnapshot>>,
     catalog_snapshot: Option<Arc<ScriptMetaCatalogSnapshot>>,
-    update_check_result: Option<UpdateCheckResult>,
+    update_check_result: Option<Arc<UpdateCheckResult>>,
     dirty_roots: BTreeMap<RootId, DirtyRootState>,
     last_memory_cache_accessed_at: Option<crate::TimestampMillis>,
     cancellation: OperationCancellation,
@@ -107,14 +107,14 @@ impl ScriptMetaKitEngine {
         let previous_roots_by_id: BTreeMap<_, _> = self
             .roots
             .iter()
-            .map(|root| (root.root_id.as_str(), root))
+            .map(|root| (root.root_id.as_ref(), root))
             .collect();
         let previous_root_ids: BTreeSet<_> = self
             .roots
             .iter()
-            .map(|root| root.root_id.as_str())
+            .map(|root| root.root_id.as_ref())
             .collect();
-        let next_root_ids: BTreeSet<_> = roots.iter().map(|root| root.root_id.as_str()).collect();
+        let next_root_ids: BTreeSet<_> = roots.iter().map(|root| root.root_id.as_ref()).collect();
         if next_root_ids.len() != roots.len() {
             return Err(ScriptMetaKitError::InvalidConfig(
                 "root_id values must be unique".to_string(),
@@ -126,7 +126,7 @@ impl ScriptMetaKitEngine {
             self.file_list_snapshots.remove(*removed_id);
             self.dirty_roots.remove(*removed_id);
             events.push(ScriptMetaKitEvent::RootRemoved {
-                root_id: (*removed_id).to_string(),
+                root_id: (*removed_id).into(),
             });
         }
 
@@ -135,13 +135,13 @@ impl ScriptMetaKitEngine {
             .next()
             .is_some();
         for root in &roots {
-            if !previous_root_ids.contains(root.root_id.as_str()) {
+            if !previous_root_ids.contains(root.root_id.as_ref()) {
                 events.push(ScriptMetaKitEvent::RootRegistered {
                     root_id: root.root_id.clone(),
                 });
             }
             let changed = previous_roots_by_id
-                .get(root.root_id.as_str())
+                .get(root.root_id.as_ref())
                 .is_some_and(|previous| {
                     previous.path != root.path
                         || previous.purpose != root.purpose
@@ -254,7 +254,7 @@ impl ScriptMetaKitEngine {
 
     #[must_use]
     pub fn update_check_result(&self) -> Option<&UpdateCheckResult> {
-        self.update_check_result.as_ref()
+        self.update_check_result.as_deref()
     }
 
     pub fn scan_roots(&mut self, request: ScanRequest) -> ScriptMetaKitResult<ScanResult> {
@@ -351,7 +351,7 @@ impl ScriptMetaKitEngine {
             }
             let update_check_result = self.preserved_update_result(
                 self.catalog_snapshot.as_deref(),
-                self.update_check_result.as_ref(),
+                self.update_check_result.as_deref(),
                 &output.file_items,
             );
             let snapshot = Arc::new(ScriptMetaCatalogSnapshot {
@@ -584,7 +584,7 @@ impl ScriptMetaKitEngine {
                 self.merge_catalog_snapshot(previous_catalog.as_deref(), partial_catalog.as_ref());
             let update_check_result = self.preserved_update_result(
                 previous_catalog.as_deref(),
-                previous_update_result.as_ref(),
+                previous_update_result.as_deref(),
                 &merged_catalog.file_items,
             );
             let merged_catalog = Arc::new(merged_catalog);
@@ -620,7 +620,7 @@ impl ScriptMetaKitEngine {
     pub async fn check_updates(
         &mut self,
         request: UpdateCheckRequest,
-    ) -> ScriptMetaKitResult<UpdateCheckResult> {
+    ) -> ScriptMetaKitResult<Arc<UpdateCheckResult>> {
         self.check_updates_items(&request.items, None, UpdateCheckCacheMode::Replace)
     }
 
@@ -628,7 +628,7 @@ impl ScriptMetaKitEngine {
         &mut self,
         request: UpdateCheckRequest,
         mut progress: impl FnMut(UpdateCheckProgress),
-    ) -> ScriptMetaKitResult<UpdateCheckResult> {
+    ) -> ScriptMetaKitResult<Arc<UpdateCheckResult>> {
         self.check_updates_items(
             &request.items,
             Some(&mut progress),
@@ -639,7 +639,7 @@ impl ScriptMetaKitEngine {
     pub async fn check_updates_for_items(
         &mut self,
         items: &[ScriptMetaItemRef],
-    ) -> ScriptMetaKitResult<UpdateCheckResult> {
+    ) -> ScriptMetaKitResult<Arc<UpdateCheckResult>> {
         self.check_updates_items(items, None, UpdateCheckCacheMode::Replace)
     }
 
@@ -647,14 +647,14 @@ impl ScriptMetaKitEngine {
         &mut self,
         items: &[ScriptMetaItemRef],
         mut progress: impl FnMut(UpdateCheckProgress),
-    ) -> ScriptMetaKitResult<UpdateCheckResult> {
+    ) -> ScriptMetaKitResult<Arc<UpdateCheckResult>> {
         self.check_updates_items(items, Some(&mut progress), UpdateCheckCacheMode::Replace)
     }
 
     pub async fn check_update_for_item(
         &mut self,
         item: ScriptMetaItemRef,
-    ) -> ScriptMetaKitResult<UpdateCheckResult> {
+    ) -> ScriptMetaKitResult<Arc<UpdateCheckResult>> {
         self.check_updates_items(&[item], None, UpdateCheckCacheMode::Merge)
     }
 
@@ -662,7 +662,7 @@ impl ScriptMetaKitEngine {
         &mut self,
         item: ScriptMetaItemRef,
         mut progress: impl FnMut(UpdateCheckProgress),
-    ) -> ScriptMetaKitResult<UpdateCheckResult> {
+    ) -> ScriptMetaKitResult<Arc<UpdateCheckResult>> {
         self.check_updates_items(&[item], Some(&mut progress), UpdateCheckCacheMode::Merge)
     }
 
@@ -671,7 +671,7 @@ impl ScriptMetaKitEngine {
         items: &[ScriptMetaItemRef],
         mut progress: Option<&mut dyn FnMut(UpdateCheckProgress)>,
         cache_mode: UpdateCheckCacheMode,
-    ) -> ScriptMetaKitResult<UpdateCheckResult> {
+    ) -> ScriptMetaKitResult<Arc<UpdateCheckResult>> {
         self.begin_operation();
         let checked_at = now_timestamp_millis();
         let mut result = UpdateCheckResult {
@@ -868,8 +868,9 @@ impl ScriptMetaKitEngine {
             },
         );
 
+        let result = Arc::new(result);
         if self.memory_cache_enabled() {
-            self.store_update_check_result(items, &result, cache_mode);
+            self.store_update_check_result(items, Arc::clone(&result), cache_mode);
             self.touch_memory_cache_if_needed();
         }
 
@@ -879,25 +880,28 @@ impl ScriptMetaKitEngine {
     fn store_update_check_result(
         &mut self,
         checked_items: &[ScriptMetaItemRef],
-        result: &UpdateCheckResult,
+        result: Arc<UpdateCheckResult>,
         cache_mode: UpdateCheckCacheMode,
     ) {
         match cache_mode {
             UpdateCheckCacheMode::Replace => {
-                self.update_check_result = Some(result.clone());
+                self.update_check_result = Some(result);
             }
             UpdateCheckCacheMode::Merge => {
-                let mut merged =
-                    self.update_check_result
-                        .take()
-                        .unwrap_or_else(|| UpdateCheckResult {
-                            checked_at: result.checked_at,
-                            operation: OperationSummary::default(),
-                            resolutions_by_item_id: BTreeMap::new(),
-                            failures_by_item_id: BTreeMap::new(),
-                            errors_by_item_id: BTreeMap::new(),
-                            statuses_by_item_id: BTreeMap::new(),
-                        });
+                let mut merged = self
+                    .update_check_result
+                    .take()
+                    .map(|result| {
+                        Arc::try_unwrap(result).unwrap_or_else(|shared| shared.as_ref().clone())
+                    })
+                    .unwrap_or_else(|| UpdateCheckResult {
+                        checked_at: result.checked_at,
+                        operation: OperationSummary::default(),
+                        resolutions_by_item_id: BTreeMap::new(),
+                        failures_by_item_id: BTreeMap::new(),
+                        errors_by_item_id: BTreeMap::new(),
+                        statuses_by_item_id: BTreeMap::new(),
+                    });
                 merged.checked_at = result.checked_at;
                 for item_id in checked_items.iter().map(|item| item.item_id()) {
                     merged.resolutions_by_item_id.remove(&item_id);
@@ -917,7 +921,7 @@ impl ScriptMetaKitEngine {
                 merged
                     .statuses_by_item_id
                     .extend(result.statuses_by_item_id.clone());
-                self.update_check_result = Some(merged);
+                self.update_check_result = Some(Arc::new(merged));
             }
         }
     }
@@ -954,7 +958,7 @@ impl ScriptMetaKitEngine {
                 catalog_snapshot.file_items = file_items;
                 let catalog_snapshot =
                     self.catalog_snapshot_for_policy(&catalog_snapshot, root_allows_memory_cache);
-                self.update_check_result = update_check_result.and_then(|result| {
+                self.update_check_result = update_check_result.as_ref().and_then(|result| {
                     filter_update_result_to_items(result, &catalog_snapshot.file_items)
                 });
                 self.catalog_snapshot = Some(Arc::new(catalog_snapshot));
@@ -1002,12 +1006,13 @@ impl ScriptMetaKitEngine {
                         snapshot.as_ref(),
                         root_allows_persistent_catalog_cache,
                     );
-                    let update_check_result = self.update_check_result.clone().and_then(|result| {
-                        filter_update_result_to_items(result, &snapshot.file_items)
-                    });
+                    let update_check_result =
+                        self.update_check_result.as_ref().and_then(|result| {
+                            filter_update_result_to_items(result, &snapshot.file_items)
+                        });
                     serde_json::to_value(CatalogCacheDataRef {
                         catalog_snapshot: &snapshot,
-                        update_check_result: update_check_result.as_ref(),
+                        update_check_result: update_check_result.as_deref(),
                     })
                 } else {
                     let persistent_roots = self
@@ -1216,11 +1221,11 @@ impl ScriptMetaKitEngine {
             return (0..self.roots.len()).collect();
         }
 
-        let requested: BTreeSet<_> = root_ids.iter().map(String::as_str).collect();
+        let requested: BTreeSet<_> = root_ids.iter().map(|root_id| root_id.as_ref()).collect();
         self.roots
             .iter()
             .enumerate()
-            .filter(|(_, root)| requested.contains(root.root_id.as_str()))
+            .filter(|(_, root)| requested.contains(root.root_id.as_ref()))
             .map(|(index, _)| index)
             .collect()
     }
@@ -1303,7 +1308,7 @@ impl ScriptMetaKitEngine {
     fn store_catalog_snapshot_if_allowed(
         &mut self,
         snapshot: &Arc<ScriptMetaCatalogSnapshot>,
-        update_check_result: Option<UpdateCheckResult>,
+        update_check_result: Option<Arc<UpdateCheckResult>>,
     ) {
         if !self.memory_cache_enabled() {
             self.catalog_snapshot = None;
@@ -1314,12 +1319,14 @@ impl ScriptMetaKitEngine {
 
         if self.catalog_snapshot_matches_policy(snapshot.as_ref(), root_allows_memory_cache) {
             self.update_check_result = update_check_result
+                .as_ref()
                 .and_then(|result| filter_update_result_to_items(result, &snapshot.file_items));
             self.catalog_snapshot = Some(Arc::clone(snapshot));
         } else {
             let snapshot =
                 self.catalog_snapshot_for_policy(snapshot.as_ref(), root_allows_memory_cache);
             self.update_check_result = update_check_result
+                .as_ref()
                 .and_then(|result| filter_update_result_to_items(result, &snapshot.file_items));
             self.catalog_snapshot = Some(Arc::new(snapshot));
         }
@@ -1336,17 +1343,17 @@ impl ScriptMetaKitEngine {
             .roots
             .iter()
             .filter(|root| allows_root(root))
-            .map(|root| root.root_id.as_str())
+            .map(|root| root.root_id.as_ref())
             .collect::<BTreeSet<_>>();
         snapshot
             .candidate_cache
             .records
             .iter()
-            .all(|record| allowed_root_ids.contains(record.root_id.as_str()))
+            .all(|record| allowed_root_ids.contains(record.root_id.as_ref()))
             && snapshot
                 .roots
                 .iter()
-                .all(|root| allowed_root_ids.contains(root.root_id.as_str()))
+                .all(|root| allowed_root_ids.contains(root.root_id.as_ref()))
     }
 
     fn catalog_snapshot_for_policy(
@@ -1358,14 +1365,14 @@ impl ScriptMetaKitEngine {
             .roots
             .iter()
             .filter(|root| allows_root(root))
-            .map(|root| root.root_id.as_str())
+            .map(|root| root.root_id.as_ref())
             .collect();
         let allowed_roots: Vec<_> = self.roots.iter().filter(|root| allows_root(root)).collect();
         let records = snapshot
             .candidate_cache
             .records
             .iter()
-            .filter(|record| allowed_root_ids.contains(record.root_id.as_str()))
+            .filter(|record| allowed_root_ids.contains(record.root_id.as_ref()))
             .cloned()
             .collect::<Vec<_>>();
         let candidate_cache = CandidateCache {
@@ -1381,7 +1388,7 @@ impl ScriptMetaKitEngine {
             roots: snapshot
                 .roots
                 .iter()
-                .filter(|root| allowed_root_ids.contains(root.root_id.as_str()))
+                .filter(|root| allowed_root_ids.contains(root.root_id.as_ref()))
                 .cloned()
                 .collect(),
             all_items,
@@ -1481,12 +1488,12 @@ impl ScriptMetaKitEngine {
         let refreshed_root_ids: BTreeSet<_> = refreshed
             .roots
             .iter()
-            .map(|root| root.root_id.as_str())
+            .map(|root| root.root_id.as_ref())
             .collect();
         let mut roots: Vec<_> = previous
             .roots
             .iter()
-            .filter(|root| !refreshed_root_ids.contains(root.root_id.as_str()))
+            .filter(|root| !refreshed_root_ids.contains(root.root_id.as_ref()))
             .cloned()
             .collect();
         roots.extend(refreshed.roots.iter().cloned());
@@ -1494,11 +1501,11 @@ impl ScriptMetaKitEngine {
             .roots
             .iter()
             .enumerate()
-            .map(|(index, root)| (root.root_id.as_str(), index))
+            .map(|(index, root)| (root.root_id.as_ref(), index))
             .collect();
         roots.sort_by_key(|root| {
             root_order
-                .get(root.root_id.as_str())
+                .get(root.root_id.as_ref())
                 .copied()
                 .unwrap_or(usize::MAX)
         });
@@ -1507,7 +1514,7 @@ impl ScriptMetaKitEngine {
             .candidate_cache
             .records
             .iter()
-            .filter(|record| !refreshed_root_ids.contains(record.root_id.as_str()))
+            .filter(|record| !refreshed_root_ids.contains(record.root_id.as_ref()))
             .cloned()
             .collect();
         records.extend(refreshed.candidate_cache.records.iter().cloned());
@@ -1537,7 +1544,7 @@ impl ScriptMetaKitEngine {
         previous: Option<&ScriptMetaCatalogSnapshot>,
         previous_result: Option<&UpdateCheckResult>,
         current_items: &[ScriptMetaItemRef],
-    ) -> Option<UpdateCheckResult> {
+    ) -> Option<Arc<UpdateCheckResult>> {
         if !self.memory_cache_enabled() || !self.config.cache.preserve_update_results {
             return None;
         }
@@ -1559,7 +1566,7 @@ impl ScriptMetaKitEngine {
             })
             .collect();
 
-        Some(UpdateCheckResult {
+        Some(Arc::new(UpdateCheckResult {
             checked_at: previous_result.checked_at,
             operation: previous_result.operation.clone(),
             resolutions_by_item_id: previous_result
@@ -1586,7 +1593,7 @@ impl ScriptMetaKitEngine {
                 .filter(|(item_id, _)| preserved_item_ids.contains(*item_id))
                 .map(|(item_id, status)| (item_id.clone(), *status))
                 .collect(),
-        })
+        }))
     }
 }
 
@@ -1640,10 +1647,10 @@ fn validate_file_list_cache_roots<'a>(
     let allowed = roots
         .iter()
         .filter(|root| allows_root(root))
-        .map(|root| root.root_id.as_str())
+        .map(|root| root.root_id.as_ref())
         .collect::<BTreeSet<_>>();
     let unknown = cached_root_ids
-        .filter(|root_id| !allowed.contains(root_id.as_str()))
+        .filter(|root_id| !allowed.contains(root_id.as_ref()))
         .cloned()
         .collect::<Vec<_>>();
     if !unknown.is_empty() {
@@ -1667,42 +1674,46 @@ fn should_mark_dirty_for_file_event(
 }
 
 fn filter_update_result_to_items(
-    result: UpdateCheckResult,
+    result: &UpdateCheckResult,
     items: &[ScriptMetaItemRef],
-) -> Option<UpdateCheckResult> {
+) -> Option<Arc<UpdateCheckResult>> {
     let item_ids = items
         .iter()
         .map(|item| item.item_id())
         .collect::<BTreeSet<_>>();
     let result = UpdateCheckResult {
         checked_at: result.checked_at,
-        operation: result.operation,
+        operation: result.operation.clone(),
         resolutions_by_item_id: result
             .resolutions_by_item_id
-            .into_iter()
-            .filter(|(item_id, _)| item_ids.contains(item_id))
+            .iter()
+            .filter(|(item_id, _)| item_ids.contains(*item_id))
+            .map(|(item_id, resolution)| (item_id.clone(), resolution.clone()))
             .collect(),
         failures_by_item_id: result
             .failures_by_item_id
-            .into_iter()
-            .filter(|(item_id, _)| item_ids.contains(item_id))
+            .iter()
+            .filter(|(item_id, _)| item_ids.contains(*item_id))
+            .map(|(item_id, failure)| (item_id.clone(), failure.clone()))
             .collect(),
         errors_by_item_id: result
             .errors_by_item_id
-            .into_iter()
-            .filter(|(item_id, _)| item_ids.contains(item_id))
+            .iter()
+            .filter(|(item_id, _)| item_ids.contains(*item_id))
+            .map(|(item_id, error)| (item_id.clone(), error.clone()))
             .collect(),
         statuses_by_item_id: result
             .statuses_by_item_id
-            .into_iter()
-            .filter(|(item_id, _)| item_ids.contains(item_id))
+            .iter()
+            .filter(|(item_id, _)| item_ids.contains(*item_id))
+            .map(|(item_id, status)| (item_id.clone(), *status))
             .collect(),
     };
     (!result.statuses_by_item_id.is_empty()
         || !result.resolutions_by_item_id.is_empty()
         || !result.failures_by_item_id.is_empty()
         || !result.errors_by_item_id.is_empty())
-    .then_some(result)
+    .then(|| Arc::new(result))
 }
 
 fn scan_file_list_job(
@@ -1770,7 +1781,7 @@ fn collect_scan_file_issues(
     for root in roots {
         if let Some(error) = root.error.as_ref() {
             issues.push(FileIssue {
-                root_id: Some(root.root_id.clone()),
+                root_id: Some(root.root_id.to_string()),
                 path: root.path.clone(),
                 code: error.code.clone(),
                 message: error.message.clone(),
@@ -1810,7 +1821,7 @@ fn collect_file_entry_issues(
     for entry in entries {
         if is_resolution_issue(entry.resolution_status) {
             output.push(FileIssue {
-                root_id: Some(root_id.clone()),
+                root_id: Some(root_id.to_string()),
                 path: entry.display_path.clone(),
                 code: file_issue_code_for_resolution(entry.resolution_status).to_string(),
                 message: entry
@@ -1824,7 +1835,7 @@ fn collect_file_entry_issues(
         }
         if entry.is_file_locked {
             output.push(FileIssue {
-                root_id: Some(root_id.clone()),
+                root_id: Some(root_id.to_string()),
                 path: entry.display_path.clone(),
                 code: "file_locked".to_string(),
                 message: "file is locked".to_string(),
@@ -1835,7 +1846,7 @@ fn collect_file_entry_issues(
         }
         if entry.is_read_only {
             output.push(FileIssue {
-                root_id: Some(root_id.clone()),
+                root_id: Some(root_id.to_string()),
                 path: entry.display_path.clone(),
                 code: "read_only".to_string(),
                 message: "file or parent directory is read-only".to_string(),
@@ -1846,7 +1857,7 @@ fn collect_file_entry_issues(
         }
         if entry.scriptmeta_edit_state == crate::core::ScriptMetaEditState::Obfuscated {
             output.push(FileIssue {
-                root_id: Some(root_id.clone()),
+                root_id: Some(root_id.to_string()),
                 path: entry.display_path.clone(),
                 code: "binary_or_obfuscated".to_string(),
                 message:
@@ -1864,7 +1875,7 @@ fn collect_file_entry_issues(
 fn collect_candidate_record_issue(record: &CandidateRecord, output: &mut Vec<FileIssue>) {
     if is_resolution_issue(record.resolution_status) {
         output.push(FileIssue {
-            root_id: Some(record.root_id.clone()),
+            root_id: Some(record.root_id.to_string()),
             path: record.file_path.clone(),
             code: file_issue_code_for_resolution(record.resolution_status).to_string(),
             message: record
@@ -2269,7 +2280,7 @@ fn apply_metadata_capabilities_to_file_list_snapshots(
         .iter()
         .map(|record| {
             (
-                (record.root_id.as_str(), record.file_path.as_path()),
+                (record.root_id.as_ref(), record.file_path.as_path()),
                 record,
             )
         })
@@ -2278,7 +2289,7 @@ fn apply_metadata_capabilities_to_file_list_snapshots(
         .iter()
         .map(|record| {
             (
-                (record.root_id.as_str(), record.identity_path.as_path()),
+                (record.root_id.as_ref(), record.identity_path.as_path()),
                 record,
             )
         })
@@ -2287,7 +2298,7 @@ fn apply_metadata_capabilities_to_file_list_snapshots(
     for snapshot in snapshots {
         if let Some(children) = snapshot.children.as_mut() {
             apply_metadata_capabilities_to_entries(
-                snapshot.root.root_id.as_str(),
+                snapshot.root.root_id.as_ref(),
                 children,
                 &capability_by_display_path,
                 &capability_by_identity_path,

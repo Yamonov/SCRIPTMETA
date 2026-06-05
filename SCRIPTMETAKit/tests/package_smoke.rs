@@ -205,9 +205,9 @@ fn builds_watch_plan_for_visible_root() {
     engine
         .set_roots(vec![
             scriptmetakit::RootRegistration {
-                root_id: "a".to_string(),
+                root_id: "a".into(),
                 path: root_a,
-                display_name: Some("A".to_string()),
+                display_name: Some("A".into()),
                 purpose: scriptmetakit::RootPurpose::FileListAndMetadata,
                 watch_policy: scriptmetakit::WatchPolicy::VisibleOnly,
                 cache_policy: scriptmetakit::CachePolicy::MemoryAndPersistent,
@@ -215,9 +215,9 @@ fn builds_watch_plan_for_visible_root() {
                 priority: scriptmetakit::RootPriority::VisibleWhenSelected,
             },
             scriptmetakit::RootRegistration {
-                root_id: "b".to_string(),
+                root_id: "b".into(),
                 path: root_b,
-                display_name: Some("B".to_string()),
+                display_name: Some("B".into()),
                 purpose: scriptmetakit::RootPurpose::FileListAndMetadata,
                 watch_policy: scriptmetakit::WatchPolicy::VisibleOnly,
                 cache_policy: scriptmetakit::CachePolicy::MemoryAndPersistent,
@@ -226,11 +226,14 @@ fn builds_watch_plan_for_visible_root() {
             },
         ])
         .expect("roots");
-    engine.set_visible_root(Some("b".to_string()));
+    engine.set_visible_root(Some("b".into()));
 
     let plan = engine.watch_plan();
     assert_eq!(plan.physical_roots.len(), 1);
-    assert_eq!(plan.physical_roots[0].covers_root_ids, vec!["b"]);
+    assert_eq!(
+        plan.physical_roots[0].covers_root_ids,
+        vec![scriptmetakit::RootId::from("b")]
+    );
 }
 
 #[test]
@@ -254,9 +257,9 @@ fn scans_metadata_and_file_list() {
     .expect("engine");
     engine
         .set_roots(vec![scriptmetakit::RootRegistration {
-            root_id: "scripts".to_string(),
+            root_id: "scripts".into(),
             path: temp.path().to_path_buf(),
-            display_name: Some("Scripts".to_string()),
+            display_name: Some("Scripts".into()),
             purpose: scriptmetakit::RootPurpose::FileListAndMetadata,
             watch_policy: scriptmetakit::WatchPolicy::AllRegistered,
             cache_policy: scriptmetakit::CachePolicy::MemoryAndPersistent,
@@ -307,9 +310,9 @@ fn memory_cache_can_be_disabled_without_hiding_scan_result() {
     let mut engine = scriptmetakit::ScriptMetaKitEngine::new(config).expect("engine");
     engine
         .set_roots(vec![scriptmetakit::RootRegistration {
-            root_id: "scripts".to_string(),
+            root_id: "scripts".into(),
             path: temp.path().to_path_buf(),
-            display_name: Some("Scripts".to_string()),
+            display_name: Some("Scripts".into()),
             purpose: scriptmetakit::RootPurpose::FileListAndMetadata,
             watch_policy: scriptmetakit::WatchPolicy::AllRegistered,
             cache_policy: scriptmetakit::CachePolicy::MemoryAndPersistent,
@@ -334,7 +337,11 @@ fn memory_cache_can_be_disabled_without_hiding_scan_result() {
             .len(),
         1
     );
-    assert!(engine.snapshot(&"scripts".to_string()).is_none());
+    assert!(
+        engine
+            .snapshot(&scriptmetakit::RootId::from("scripts"))
+            .is_none()
+    );
     assert!(engine.catalog_snapshot().is_none());
 }
 
@@ -357,9 +364,9 @@ fn root_cache_policy_disabled_skips_engine_storage_only() {
     .expect("engine");
     engine
         .set_roots(vec![scriptmetakit::RootRegistration {
-            root_id: "scripts".to_string(),
+            root_id: "scripts".into(),
             path: temp.path().to_path_buf(),
-            display_name: Some("Scripts".to_string()),
+            display_name: Some("Scripts".into()),
             purpose: scriptmetakit::RootPurpose::FileListAndMetadata,
             watch_policy: scriptmetakit::WatchPolicy::AllRegistered,
             cache_policy: scriptmetakit::CachePolicy::Disabled,
@@ -383,7 +390,11 @@ fn root_cache_policy_disabled_skips_engine_storage_only() {
             .len(),
         1
     );
-    assert!(engine.snapshot(&"scripts".to_string()).is_none());
+    assert!(
+        engine
+            .snapshot(&scriptmetakit::RootId::from("scripts"))
+            .is_none()
+    );
     assert!(
         engine
             .catalog_snapshot()
@@ -458,14 +469,14 @@ fn scans_multiple_root_paths_with_root_aware_result() {
     let mut item_ids: Vec<_> = catalog
         .all_items
         .iter()
-        .map(|item| (item.root_id.as_str(), item.script_id.as_str()))
+        .map(|item| (item.root_id.as_ref(), item.script_id.as_ref()))
         .collect();
     item_ids.sort();
     assert_eq!(
         item_ids,
         vec![
-            (root_a_id.as_str(), "com.example.a"),
-            (root_b_id.as_str(), "com.example.b")
+            (root_a_id.as_ref(), "com.example.a"),
+            (root_b_id.as_ref(), "com.example.b")
         ]
     );
 }
@@ -837,7 +848,7 @@ fn editkit_writes_compiled_scpt_metadata() {
     let backup_root = temp.path().join("backups");
     let draft = scriptmetakit::ScriptMetadataDraft {
         script_id: "com.example.edit.compiled".to_string(),
-        version: Some("v3. 4 .5".to_string()),
+        version: Some("v3. 4 .5".into()),
         meta_url: Some(url::Url::parse("https://example.com/SCRIPTMETA.txt").expect("url")),
         ..scriptmetakit::ScriptMetadataDraft::default()
     };
@@ -1031,7 +1042,7 @@ fn detects_jxa_shebang_for_js_and_applescript_files() {
     let runtime_by_script_id: std::collections::BTreeMap<_, _> = catalog
         .all_items
         .iter()
-        .map(|item| (item.script_id.as_str(), item.runtime_kind))
+        .map(|item| (item.script_id.as_ref(), item.runtime_kind))
         .collect();
 
     assert_eq!(
@@ -1242,9 +1253,9 @@ fn scans_scripts_in_third_level_directory() {
     .expect("engine");
     engine
         .set_roots(vec![scriptmetakit::RootRegistration {
-            root_id: "scripts".to_string(),
+            root_id: "scripts".into(),
             path: temp.path().to_path_buf(),
-            display_name: Some("Scripts".to_string()),
+            display_name: Some("Scripts".into()),
             purpose: scriptmetakit::RootPurpose::FileListAndMetadata,
             watch_policy: scriptmetakit::WatchPolicy::AllRegistered,
             cache_policy: scriptmetakit::CachePolicy::MemoryAndPersistent,
@@ -1300,9 +1311,9 @@ SCRIPTMETA-END
     .expect("engine");
     engine
         .set_roots(vec![scriptmetakit::RootRegistration {
-            root_id: "scripts".to_string(),
+            root_id: "scripts".into(),
             path: temp.path().to_path_buf(),
-            display_name: Some("Photoshop".to_string()),
+            display_name: Some("Photoshop".into()),
             purpose: scriptmetakit::RootPurpose::FileListAndMetadata,
             watch_policy: scriptmetakit::WatchPolicy::AllRegistered,
             cache_policy: scriptmetakit::CachePolicy::MemoryAndPersistent,
@@ -1556,7 +1567,7 @@ fn scans_macos_alias_directory_with_display_path_preserved() {
     create_macos_alias(target.path(), &alias_path, true);
 
     let result = scriptmetakit::scanner::scan_file_list_root(
-        &"root".to_string(),
+        &scriptmetakit::RootId::from("root"),
         temp.path(),
         &scriptmetakit::ScannerOptions::default(),
         &scriptmetakit::ExtensionPolicy::default(),
@@ -1595,7 +1606,7 @@ fn scans_macos_alias_script_without_alias_extension() {
     create_macos_alias(&target_script, &alias_script, false);
 
     let result = scriptmetakit::scanner::scan_file_list_root(
-        &"root".to_string(),
+        &scriptmetakit::RootId::from("root"),
         temp.path(),
         &scriptmetakit::ScannerOptions::default(),
         &scriptmetakit::ExtensionPolicy::default(),
@@ -1641,7 +1652,7 @@ fn skips_macos_alias_script_when_resolution_is_disabled() {
         ..Default::default()
     };
     let file_list = scriptmetakit::scanner::scan_file_list_root(
-        &"root".to_string(),
+        &scriptmetakit::RootId::from("root"),
         root.path(),
         &scanner_options,
         &scriptmetakit::ExtensionPolicy::default(),
@@ -1681,7 +1692,7 @@ fn reports_macos_alias_directory_cycle_without_descending() {
     create_macos_alias(temp.path(), &alias_path, true);
 
     let result = scriptmetakit::scanner::scan_file_list_root(
-        &"root".to_string(),
+        &scriptmetakit::RootId::from("root"),
         temp.path(),
         &scriptmetakit::ScannerOptions::default(),
         &scriptmetakit::ExtensionPolicy::default(),
@@ -1713,7 +1724,7 @@ fn preflight_rejects_low_script_density_root_before_full_file_list_scan() {
 
     let options = low_script_density_preflight_options();
     let result = scriptmetakit::scanner::scan_file_list_root(
-        &"root".to_string(),
+        &scriptmetakit::RootId::from("root"),
         temp.path(),
         &options,
         &scriptmetakit::ExtensionPolicy::default(),
@@ -1740,7 +1751,7 @@ fn preflight_allows_script_dense_root() {
 
     let options = low_script_density_preflight_options();
     let result = scriptmetakit::scanner::scan_file_list_root(
-        &"root".to_string(),
+        &scriptmetakit::RootId::from("root"),
         temp.path(),
         &options,
         &scriptmetakit::ExtensionPolicy::default(),
@@ -1886,7 +1897,7 @@ fn metadata_scan_reports_max_depth_limit() {
 #[test]
 fn rejects_restricted_registered_root_before_scanning() {
     let result = scriptmetakit::scanner::scan_file_list_root(
-        &"root".to_string(),
+        &scriptmetakit::RootId::from("root"),
         std::path::Path::new("/"),
         &scriptmetakit::ScannerOptions::default(),
         &scriptmetakit::ExtensionPolicy::default(),
@@ -1978,7 +1989,7 @@ alert('first updated');
     let script_ids: std::collections::BTreeSet<_> = catalog
         .all_items
         .iter()
-        .map(|item| item.script_id.as_str())
+        .map(|item| item.script_id.as_ref())
         .collect();
     assert!(script_ids.contains("com.example.first"));
     assert!(script_ids.contains("com.example.second"));
@@ -2548,18 +2559,18 @@ SCRIPTMETA-DIST-END
     .expect("engine");
     let result = pollster::block_on(engine.check_updates(scriptmetakit::UpdateCheckRequest {
         items: vec![scriptmetakit::ScriptMetaItem {
-            root_id: "scripts".to_string(),
+            root_id: "scripts".into(),
             file_path: temp.path().join("Example.jsx"),
             identity_path: temp.path().join("Example.jsx"),
             runtime_kind: None,
             shebang: None,
             script_id: "com.example.script".to_string(),
-            version: Some("2.0.0".to_string()),
+            version: Some("2.0.0".into()),
             description: None,
             target_app: None,
             min_target_version: None,
             meta_url: Some(dist_url),
-            name: Some("Example".to_string()),
+            name: Some("Example".into()),
             author: None,
             release_date: None,
             edit_password_sha256: None,
@@ -2612,18 +2623,18 @@ SCRIPTMETA-DIST-END
     let first_path = temp.path().join("First.jsx");
     let second_path = temp.path().join("Second.jsx");
     let first_item: scriptmetakit::ScriptMetaItemRef = scriptmetakit::ScriptMetaItem {
-        root_id: "scripts".to_string(),
+        root_id: "scripts".into(),
         file_path: first_path.clone(),
         identity_path: first_path.clone(),
         runtime_kind: None,
         shebang: None,
         script_id: "com.example.single.first".to_string(),
-        version: Some("1.0.0".to_string()),
+        version: Some("1.0.0".into()),
         description: None,
         target_app: None,
         min_target_version: None,
         meta_url: Some(first_dist_url),
-        name: Some("First".to_string()),
+        name: Some("First".into()),
         author: None,
         release_date: None,
         edit_password_sha256: None,
@@ -2637,18 +2648,18 @@ SCRIPTMETA-DIST-END
     }
     .into();
     let second_item: scriptmetakit::ScriptMetaItemRef = scriptmetakit::ScriptMetaItem {
-        root_id: "scripts".to_string(),
+        root_id: "scripts".into(),
         file_path: second_path.clone(),
         identity_path: second_path.clone(),
         runtime_kind: None,
         shebang: None,
         script_id: "com.example.single.second".to_string(),
-        version: Some("1.0.0".to_string()),
+        version: Some("1.0.0".into()),
         description: None,
         target_app: None,
         min_target_version: None,
         meta_url: Some(second_dist_url),
-        name: Some("Second".to_string()),
+        name: Some("Second".into()),
         author: None,
         release_date: None,
         edit_password_sha256: None,
@@ -2733,18 +2744,18 @@ SCRIPTMETA-DIST-END
     .expect("engine");
     let result = pollster::block_on(engine.check_updates(scriptmetakit::UpdateCheckRequest {
         items: vec![scriptmetakit::ScriptMetaItem {
-            root_id: "scripts".to_string(),
+            root_id: "scripts".into(),
             file_path: script_path.clone(),
             identity_path: script_path,
             runtime_kind: None,
             shebang: None,
             script_id: "com.example.large.page".to_string(),
-            version: Some("6.0.0".to_string()),
+            version: Some("6.0.0".into()),
             description: None,
             target_app: None,
             min_target_version: None,
             meta_url: Some(dist_url),
-            name: Some("Large".to_string()),
+            name: Some("Large".into()),
             author: None,
             release_date: None,
             edit_password_sha256: None,
@@ -2788,18 +2799,18 @@ SCRIPTMETA-DIST-END
     .expect("engine");
     let result = pollster::block_on(engine.check_updates(scriptmetakit::UpdateCheckRequest {
         items: vec![scriptmetakit::ScriptMetaItem {
-            root_id: "scripts".to_string(),
+            root_id: "scripts".into(),
             file_path: script_path.clone(),
             identity_path: script_path.clone(),
             runtime_kind: None,
             shebang: None,
             script_id: "com.example.script".to_string(),
-            version: Some("2.0.0".to_string()),
+            version: Some("2.0.0".into()),
             description: None,
             target_app: None,
             min_target_version: None,
             meta_url: Some(dist_url.clone()),
-            name: Some("Example".to_string()),
+            name: Some("Example".into()),
             author: None,
             release_date: None,
             edit_password_sha256: None,
@@ -3021,18 +3032,18 @@ SCRIPTMETA-DIST-END
     .expect("engine");
     let result = pollster::block_on(engine.check_updates(scriptmetakit::UpdateCheckRequest {
         items: vec![scriptmetakit::ScriptMetaItem {
-            root_id: "scripts".to_string(),
+            root_id: "scripts".into(),
             file_path: temp.path().join("Second.jsx"),
             identity_path: temp.path().join("Second.jsx"),
             runtime_kind: None,
             shebang: None,
             script_id: "org.example.second".to_string(),
-            version: Some("2.0.0".to_string()),
+            version: Some("2.0.0".into()),
             description: None,
             target_app: None,
             min_target_version: None,
             meta_url: Some(dist_url),
-            name: Some("Second".to_string()),
+            name: Some("Second".into()),
             author: None,
             release_date: None,
             edit_password_sha256: None,
@@ -3096,18 +3107,18 @@ SCRIPTMETA-DIST-END
     .expect("engine");
     let result = pollster::block_on(engine.check_updates(scriptmetakit::UpdateCheckRequest {
         items: vec![scriptmetakit::ScriptMetaItem {
-            root_id: "scripts".to_string(),
+            root_id: "scripts".into(),
             file_path: temp.path().join("Example.jsx"),
             identity_path: temp.path().join("Example.jsx"),
             runtime_kind: None,
             shebang: None,
             script_id: "com.example.script".to_string(),
-            version: Some("3.0.0".to_string()),
+            version: Some("3.0.0".into()),
             description: None,
             target_app: None,
             min_target_version: None,
             meta_url: Some(first_url),
-            name: Some("Example".to_string()),
+            name: Some("Example".into()),
             author: None,
             release_date: None,
             edit_password_sha256: None,
@@ -3239,7 +3250,7 @@ fn script_item_for_update(
     meta_url: url::Url,
 ) -> scriptmetakit::ScriptMetaItemRef {
     scriptmetakit::ScriptMetaItem {
-        root_id: "scripts".to_string(),
+        root_id: "scripts".into(),
         file_path: script_path.to_path_buf(),
         identity_path: script_path.to_path_buf(),
         runtime_kind: None,
@@ -3282,18 +3293,18 @@ SCRIPTMETA-DIST-END
     .expect("engine");
     let result = pollster::block_on(engine.check_updates(scriptmetakit::UpdateCheckRequest {
         items: vec![scriptmetakit::ScriptMetaItem {
-            root_id: "scripts".to_string(),
+            root_id: "scripts".into(),
             file_path: temp.path().join("Http.jsx"),
             identity_path: temp.path().join("Http.jsx"),
             runtime_kind: None,
             shebang: None,
             script_id: "com.example.http".to_string(),
-            version: Some("4.0.0".to_string()),
+            version: Some("4.0.0".into()),
             description: None,
             target_app: None,
             min_target_version: None,
             meta_url: Some(url),
-            name: Some("HTTP".to_string()),
+            name: Some("HTTP".into()),
             author: None,
             release_date: None,
             edit_password_sha256: None,

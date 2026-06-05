@@ -153,7 +153,7 @@ pub struct ScanResult {
     #[serde(default)]
     pub file_issues: Vec<FileIssue>,
     #[serde(default)]
-    pub update_check_result: Option<UpdateCheckResult>,
+    pub update_check_result: Option<Arc<UpdateCheckResult>>,
     #[serde(default)]
     pub change_summary: Option<ScanChangeSummary>,
     #[serde(default)]

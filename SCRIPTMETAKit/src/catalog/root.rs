@@ -114,4 +114,5 @@ pub fn path_based_root_id(path: impl AsRef<Path>) -> RootId {
         .unwrap_or_else(|_| path.to_path_buf())
         .to_string_lossy()
         .into_owned()
+        .into()
 }

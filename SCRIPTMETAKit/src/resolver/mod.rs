@@ -285,8 +285,8 @@ impl DistributionResolver {
             .cache
             .lock()
             .map_err(|_| ScriptMetaKitError::Cache("distribution cache is poisoned".to_string()))?;
-        cache.source_cache.insert(key.clone(), source);
         touch_cache_key(&mut cache.source_order, &key);
+        cache.source_cache.insert(key, source);
         evict_source_cache_entries(&mut cache);
         Ok(())
     }
@@ -315,8 +315,8 @@ impl DistributionResolver {
             .cache
             .lock()
             .map_err(|_| ScriptMetaKitError::Cache("distribution cache is poisoned".to_string()))?;
-        cache.parsed_cache.insert(key.clone(), records);
         touch_cache_key(&mut cache.parsed_order, &key);
+        cache.parsed_cache.insert(key, records);
         evict_parsed_cache_entries(&mut cache);
         Ok(())
     }
