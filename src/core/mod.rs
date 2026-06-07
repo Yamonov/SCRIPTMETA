@@ -18,5 +18,8 @@ pub use parser::{
     normalize_metadata_url, parse_distribution_metadata, parse_distribution_metadata_for_script,
     parse_distribution_metadata_records, parse_script_metadata,
 };
-pub use text::{decode_script_text, decode_script_text_strict};
+pub use text::{
+    DecodedScriptText, ScriptTextEncoding, decode_script_text, decode_script_text_strict,
+    decode_script_text_with_encoding, encode_script_text,
+};
 pub use version::{VersionOrdering, compare_versions, normalize_version_string};

@@ -1,11 +1,10 @@
-pub(crate) mod compiled_osa;
 mod file_list;
 mod metadata_scan;
 mod options;
 mod path_resolution;
 mod root_preflight;
-mod script_detection;
 
+pub use crate::formats::{ScriptFileInfo, detect_script_file};
 pub use file_list::{
     DirectoryScanOutput, FileSystemEntry, scan_file_list_root,
     scan_file_list_root_with_dirty_directories,
@@ -24,4 +23,4 @@ pub(crate) use metadata_scan::{
 };
 pub use options::{ExtensionPolicy, RootPreflightOptions, ScannerOptions};
 pub use path_resolution::{PathKind, PathResolutionStatus};
-pub use script_detection::{ScriptFileInfo, detect_script_file};
+pub use root_preflight::can_read_directory_contents;

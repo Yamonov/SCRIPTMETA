@@ -15,6 +15,7 @@ use crate::{
 pub const DEFAULT_DEBOUNCE_DELAY_MILLIS: u64 = 500;
 pub const DEFAULT_MAX_DELIVERY_DELAY_MILLIS: u64 = 2_000;
 pub const DEFAULT_MAX_PENDING_PATHS: usize = 1_024;
+pub const DEFAULT_NATIVE_EVENT_LATENCY_MILLIS: u64 = 0;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WatchPlan {
@@ -22,6 +23,7 @@ pub struct WatchPlan {
     pub logical_roots: Vec<LogicalWatchRoot>,
     pub debounce_delay_millis: u64,
     pub max_delivery_delay_millis: u64,
+    pub native_event_latency_millis: u64,
     pub max_pending_paths: usize,
     pub supported_extensions: ExtensionPolicy,
     pub skip_hidden_paths: bool,
@@ -36,6 +38,7 @@ impl WatchPlan {
             logical_roots: Vec::new(),
             debounce_delay_millis: DEFAULT_DEBOUNCE_DELAY_MILLIS,
             max_delivery_delay_millis: DEFAULT_MAX_DELIVERY_DELAY_MILLIS,
+            native_event_latency_millis: DEFAULT_NATIVE_EVENT_LATENCY_MILLIS,
             max_pending_paths: DEFAULT_MAX_PENDING_PATHS,
             supported_extensions: ExtensionPolicy::script_default(),
             skip_hidden_paths: true,

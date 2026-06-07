@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
     io::{self, Read},
@@ -15,7 +16,12 @@ use crate::{
         DirectoryState, DirectoryStateMap, FileEntryChange, FileEntryChangeKind, FileIdentity,
         FileListSnapshot, RootError, RootSnapshot, RootStatus, ScanChangeSummary,
     },
-    core::{OperationCancellation, ScriptRuntimeKind},
+    core::{OperationCancellation, ScriptMetaItemRef, ScriptRuntimeKind},
+    formats::{
+        ScriptFileInfo, detect_script_file, detect_script_file_from_bytes, is_script_package_path,
+        needs_script_header_probe, script_header_probe_byte_limit,
+        scriptmeta_edit_capability_from_file_list_probe,
+    },
     now_timestamp_millis,
     scanner::{ExtensionPolicy, ScannerOptions},
     watcher::normalize_path,
@@ -26,10 +32,6 @@ use super::{
         PathKind, PathResolutionStatus, ResolvedPath, path_error_status, resolve_scannable_path,
     },
     root_preflight::{root_content_preflight_issue, root_location_issue},
-    script_detection::{
-        detect_script_file, detect_script_file_from_bytes, needs_script_header_probe,
-        script_header_probe_byte_limit, scriptmeta_edit_capability_from_file_list_probe,
-    },
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -67,6 +69,8 @@ pub struct FileSystemEntry {
     pub can_append_scriptmeta: bool,
     #[serde(default)]
     pub scriptmeta_edit_state: crate::core::ScriptMetaEditState,
+    #[serde(default)]
+    pub scriptmeta_item: Option<ScriptMetaItemRef>,
     pub children: Vec<FileSystemEntry>,
 }
 
@@ -120,6 +124,7 @@ pub(crate) fn scan_file_list_root_controlled(
         started,
         visited_directories: BTreeSet::new(),
         visited_nodes: 0,
+        scanned_nodes: 0,
         directory_states: DirectoryStateMap::new(),
         directory_read_errors: BTreeMap::new(),
         truncated: false,
@@ -274,6 +279,7 @@ pub(crate) fn scan_file_list_root_with_dirty_directories_controlled(
     let mut timed_out = false;
     let mut cancelled = false;
     let mut root_error = None;
+    let mut scanned_nodes = 0;
 
     for dirty_directory in &dirty_directories {
         if !directory_exists_in_entries(&children, dirty_directory) {
@@ -295,15 +301,19 @@ pub(crate) fn scan_file_list_root_with_dirty_directories_controlled(
                     options,
                     extensions,
                     cancellation,
+                    scanned_nodes,
                 );
-                replace_directory_children(
-                    &mut children,
-                    dirty_directory,
-                    output.children,
-                    output.directory_error,
-                );
-                remove_directory_states_under(&mut directory_states, dirty_directory);
-                directory_states.extend(output.directory_states);
+                scanned_nodes = output.scanned_nodes;
+                if output.completed {
+                    replace_directory_children(
+                        &mut children,
+                        dirty_directory,
+                        output.children,
+                        output.directory_error,
+                    );
+                    remove_directory_states_under(&mut directory_states, dirty_directory);
+                    directory_states.extend(output.directory_states);
+                }
                 truncated |= output.truncated;
                 timed_out |= output.timed_out;
                 cancelled |= output.cancelled;
@@ -393,6 +403,7 @@ pub(crate) fn try_scan_file_list_root_with_owned_dirty_directories_controlled(
     let mut timed_out = false;
     let mut cancelled = false;
     let mut root_error = None;
+    let mut scanned_nodes = 0;
 
     for dirty_directory in &dirty_directories {
         match fs::metadata(dirty_directory) {
@@ -404,15 +415,19 @@ pub(crate) fn try_scan_file_list_root_with_owned_dirty_directories_controlled(
                     options,
                     extensions,
                     cancellation,
+                    scanned_nodes,
                 );
-                replace_directory_children(
-                    &mut children,
-                    dirty_directory,
-                    output.children,
-                    output.directory_error,
-                );
-                remove_directory_states_under(&mut directory_states, dirty_directory);
-                directory_states.extend(output.directory_states);
+                scanned_nodes = output.scanned_nodes;
+                if output.completed {
+                    replace_directory_children(
+                        &mut children,
+                        dirty_directory,
+                        output.children,
+                        output.directory_error,
+                    );
+                    remove_directory_states_under(&mut directory_states, dirty_directory);
+                    directory_states.extend(output.directory_states);
+                }
                 truncated |= output.truncated;
                 timed_out |= output.timed_out;
                 cancelled |= output.cancelled;
@@ -475,6 +490,8 @@ struct PartialDirectoryScanOutput {
     timed_out: bool,
     cancelled: bool,
     root_error: Option<RootError>,
+    scanned_nodes: usize,
+    completed: bool,
 }
 
 fn scan_file_list_directory(
@@ -484,6 +501,7 @@ fn scan_file_list_directory(
     options: &ScannerOptions,
     extensions: &ExtensionPolicy,
     cancellation: Option<&OperationCancellation>,
+    scanned_nodes: usize,
 ) -> PartialDirectoryScanOutput {
     let mut state = FileListWalkState {
         options,
@@ -494,6 +512,7 @@ fn scan_file_list_directory(
         started: Instant::now(),
         visited_directories: BTreeSet::new(),
         visited_nodes: 0,
+        scanned_nodes,
         directory_states: DirectoryStateMap::new(),
         directory_read_errors: BTreeMap::new(),
         truncated: false,
@@ -503,20 +522,21 @@ fn scan_file_list_directory(
         cancellation,
     };
     let resolved_directory = normalize_path(source_directory);
-    let children =
-        scan_directory(display_directory, source_directory, depth, &mut state).unwrap_or_default();
+    let children = scan_directory(display_directory, source_directory, depth, &mut state);
     let directory_error = state
         .directory_read_errors
         .get(&resolved_directory)
         .cloned();
     PartialDirectoryScanOutput {
-        children,
+        completed: children.is_some(),
+        children: children.unwrap_or_default(),
         directory_states: state.directory_states,
         directory_error,
         truncated: state.truncated,
         timed_out: state.timed_out,
         cancelled: state.cancelled,
         root_error: state.root_error,
+        scanned_nodes: state.scanned_nodes,
     }
 }
 
@@ -527,6 +547,7 @@ struct FileListWalkState<'a> {
     started: Instant,
     visited_directories: BTreeSet<PathBuf>,
     visited_nodes: usize,
+    scanned_nodes: usize,
     directory_states: DirectoryStateMap,
     directory_read_errors: BTreeMap<PathBuf, (PathResolutionStatus, String)>,
     truncated: bool,
@@ -571,6 +592,7 @@ fn scan_directory(
         if should_stop(depth, state) {
             break;
         }
+        state.scanned_nodes = state.scanned_nodes.saturating_add(1);
 
         let source_path = entry.path();
         let display_path = display_directory.join(entry.file_name());
@@ -673,6 +695,7 @@ fn scan_directory(
                     can_edit_scriptmeta: false,
                     can_append_scriptmeta: false,
                     scriptmeta_edit_state: crate::core::ScriptMetaEditState::Unsupported,
+                    scriptmeta_item: None,
                     children: nested_children,
                 });
                 state.visited_nodes += 1;
@@ -702,17 +725,14 @@ fn scan_directory(
                 can_edit_scriptmeta: file_info.capability.can_edit_scriptmeta,
                 can_append_scriptmeta: file_info.capability.can_append_scriptmeta,
                 scriptmeta_edit_state: file_info.capability.scriptmeta_edit_state,
+                scriptmeta_item: None,
                 children: Vec::new(),
             });
             state.visited_nodes += 1;
         }
     }
 
-    children.sort_by(|lhs, rhs| {
-        rhs.is_directory
-            .cmp(&lhs.is_directory)
-            .then_with(|| display_name(&lhs.display_path).cmp(&display_name(&rhs.display_path)))
-    });
+    children.sort_by(compare_file_list_entries);
 
     let fingerprint = child_fingerprint(&children);
     state.directory_states.insert(
@@ -739,7 +759,7 @@ fn should_stop(depth: usize, state: &mut FileListWalkState<'_>) -> bool {
         return true;
     }
 
-    if depth > state.options.max_depth || state.visited_nodes >= state.options.max_nodes_per_root {
+    if depth > state.options.max_depth || state.scanned_nodes >= state.options.max_nodes_per_root {
         state.truncated = true;
         return true;
     }
@@ -798,6 +818,7 @@ fn resolution_error_entry(resolved: ResolvedPath) -> FileSystemEntry {
         can_edit_scriptmeta: false,
         can_append_scriptmeta: false,
         scriptmeta_edit_state: crate::core::ScriptMetaEditState::Unknown,
+        scriptmeta_item: None,
         children: Vec::new(),
     }
 }
@@ -826,6 +847,7 @@ fn script_package_entry(
         can_edit_scriptmeta: false,
         can_append_scriptmeta: false,
         scriptmeta_edit_state: crate::core::ScriptMetaEditState::Unsupported,
+        scriptmeta_item: None,
         children: Vec::new(),
     }
 }
@@ -880,12 +902,6 @@ fn is_package_path(path: &Path) -> bool {
         path.extension().and_then(|extension| extension.to_str()),
         Some("app" | "bundle" | "framework" | "plugin" | "appex")
     )
-}
-
-fn is_script_package_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("scptd"))
 }
 
 fn normalize_dirty_directories(directories: &[PathBuf], root_path: &Path) -> Vec<PathBuf> {
@@ -1017,11 +1033,7 @@ fn sort_entries(entries: &mut [FileSystemEntry]) {
     for entry in entries.iter_mut() {
         sort_entries(&mut entry.children);
     }
-    entries.sort_by(|lhs, rhs| {
-        rhs.is_directory
-            .cmp(&lhs.is_directory)
-            .then_with(|| display_name(&lhs.display_path).cmp(&display_name(&rhs.display_path)))
-    });
+    entries.sort_by(compare_file_list_entries);
 }
 
 fn remove_directory_states_under(states: &mut DirectoryStateMap, directory: &Path) {
@@ -1130,8 +1142,110 @@ fn display_name(path: &Path) -> Cow<'_, str> {
         .unwrap_or(Cow::Borrowed(""))
 }
 
+fn compare_file_list_entries(lhs: &FileSystemEntry, rhs: &FileSystemEntry) -> Ordering {
+    rhs.is_directory.cmp(&lhs.is_directory).then_with(|| {
+        compare_display_names(
+            &display_name(&lhs.display_path),
+            &display_name(&rhs.display_path),
+        )
+    })
+}
+
+fn compare_display_names(lhs: &str, rhs: &str) -> Ordering {
+    let ordering = platform_display_name_compare(lhs, rhs);
+    if ordering == Ordering::Equal {
+        lhs.cmp(rhs)
+    } else {
+        ordering
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn platform_display_name_compare(lhs: &str, rhs: &str) -> Ordering {
+    use objc2_foundation::NSString;
+
+    let lhs = NSString::from_str(lhs);
+    let rhs = NSString::from_str(rhs);
+    lhs.localizedStandardCompare(&rhs).into()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn platform_display_name_compare(lhs: &str, rhs: &str) -> Ordering {
+    portable_display_name_compare(lhs, rhs)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn portable_display_name_compare(lhs: &str, rhs: &str) -> Ordering {
+    let mut lhs_chars = lhs.chars().peekable();
+    let mut rhs_chars = rhs.chars().peekable();
+
+    loop {
+        match (lhs_chars.peek().copied(), rhs_chars.peek().copied()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(lhs_char), Some(rhs_char))
+                if lhs_char.is_ascii_digit() && rhs_char.is_ascii_digit() =>
+            {
+                let lhs_number = take_ascii_number(&mut lhs_chars);
+                let rhs_number = take_ascii_number(&mut rhs_chars);
+                let ordering = compare_ascii_numbers(&lhs_number, &rhs_number);
+                if ordering != Ordering::Equal {
+                    return ordering;
+                }
+            }
+            (Some(lhs_char), Some(rhs_char)) => {
+                lhs_chars.next();
+                rhs_chars.next();
+                let ordering = lhs_char
+                    .to_lowercase()
+                    .cmp(rhs_char.to_lowercase())
+                    .then_with(|| lhs_char.cmp(&rhs_char));
+                if ordering != Ordering::Equal {
+                    return ordering;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn take_ascii_number(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> String {
+    let mut value = String::new();
+    while let Some(char) = chars.peek().copied() {
+        if !char.is_ascii_digit() {
+            break;
+        }
+        value.push(char);
+        chars.next();
+    }
+    value
+}
+
+#[cfg(not(target_os = "macos"))]
+fn compare_ascii_numbers(lhs: &str, rhs: &str) -> Ordering {
+    let lhs_trimmed = lhs.trim_start_matches('0');
+    let rhs_trimmed = rhs.trim_start_matches('0');
+    let lhs_significant = if lhs_trimmed.is_empty() {
+        "0"
+    } else {
+        lhs_trimmed
+    };
+    let rhs_significant = if rhs_trimmed.is_empty() {
+        "0"
+    } else {
+        rhs_trimmed
+    };
+
+    lhs_significant
+        .len()
+        .cmp(&rhs_significant.len())
+        .then_with(|| lhs_significant.cmp(rhs_significant))
+        .then_with(|| lhs.len().cmp(&rhs.len()))
+}
+
 struct FileListScriptInfo {
-    script: super::script_detection::ScriptFileInfo,
+    script: ScriptFileInfo,
     capability: crate::core::ScriptMetaEditCapability,
 }
 
@@ -1219,4 +1333,120 @@ pub(crate) fn system_time_millis(time: SystemTime) -> Option<u64> {
     time.duration_since(SystemTime::UNIX_EPOCH)
         .ok()
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn entry(name: &str, is_directory: bool) -> FileSystemEntry {
+        FileSystemEntry {
+            display_path: PathBuf::from(name),
+            resolved_path: PathBuf::from(name),
+            path_kind: PathKind::Normal,
+            resolution_status: PathResolutionStatus::Resolved,
+            resolution_message: None,
+            is_directory,
+            file_size: None,
+            content_modified_at: None,
+            identity: None,
+            runtime_kind: None,
+            shebang: None,
+            has_scriptmeta: false,
+            has_scriptmeta_edit_password: false,
+            is_file_locked: false,
+            is_read_only: false,
+            can_edit_scriptmeta: false,
+            can_append_scriptmeta: false,
+            scriptmeta_edit_state: crate::core::ScriptMetaEditState::Unknown,
+            scriptmeta_item: None,
+            children: Vec::new(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn display_name_order_matches_macos_localized_standard_compare() {
+        let mut names = [
+            "ActionHelperScripts",
+            "Import-Export-Guides-Photoshop",
+            "KM",
+            "Photoshop",
+            "Scripts",
+            "_GIT",
+            "test",
+            "Illustrator に移動",
+            "InDesignで表示する",
+            "StarLayerToggle",
+            "opacity_Enhancer",
+            "ゴミ取りカーブtoggle",
+            "テクスチャ塗り",
+            "ノイズテクスチャレイヤー",
+            "選択範囲をガイドに",
+        ];
+
+        names.sort_by(|lhs, rhs| compare_display_names(lhs, rhs));
+
+        assert_eq!(
+            names,
+            [
+                "_GIT",
+                "ActionHelperScripts",
+                "Illustrator に移動",
+                "Import-Export-Guides-Photoshop",
+                "InDesignで表示する",
+                "KM",
+                "opacity_Enhancer",
+                "Photoshop",
+                "Scripts",
+                "StarLayerToggle",
+                "test",
+                "ゴミ取りカーブtoggle",
+                "テクスチャ塗り",
+                "ノイズテクスチャレイヤー",
+                "選択範囲をガイドに",
+            ]
+        );
+    }
+
+    #[test]
+    fn file_list_entries_keep_directories_before_files() {
+        let mut entries = [
+            entry("b.jsx", false),
+            entry("a-folder", true),
+            entry("a.jsx", false),
+            entry("_folder", true),
+        ];
+
+        entries.sort_by(compare_file_list_entries);
+
+        let ordered: Vec<_> = entries
+            .iter()
+            .map(|entry| display_name(&entry.display_path).into_owned())
+            .collect();
+        assert_eq!(ordered, ["_folder", "a-folder", "a.jsx", "b.jsx"]);
+    }
+
+    #[test]
+    fn file_list_node_limit_counts_non_script_entries() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        fs::write(directory.path().join("one.txt"), "one").expect("write one");
+        fs::write(directory.path().join("two.txt"), "two").expect("write two");
+
+        let options = ScannerOptions {
+            max_nodes_per_root: 1,
+            ..Default::default()
+        };
+        let output = scan_file_list_root(
+            &RootId::from("root"),
+            directory.path(),
+            &options,
+            &ExtensionPolicy::script_default(),
+        );
+
+        assert!(output.truncated);
+        assert_eq!(output.root.item_count, 0);
+        assert!(output.children.is_empty());
+    }
 }

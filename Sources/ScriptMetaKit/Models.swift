@@ -1,5 +1,188 @@
 import Foundation
 
+private nonisolated let smkPolicyStatusOK: Int32 = 0
+
+private nonisolated struct SmkPolicyUtf8Slice {
+    var ptr: UnsafePointer<UInt8>?
+    var len: Int
+
+    init(ptr: UnsafePointer<UInt8>? = nil, len: Int = 0) {
+        self.ptr = ptr
+        self.len = len
+    }
+}
+
+private nonisolated struct SmkPolicyScriptFileInspection {
+    var isSupportedScriptPath: UInt8
+    var runtimeKind: SmkPolicyUtf8Slice
+    var shebang: SmkPolicyUtf8Slice
+    var commentSyntax: SmkPolicyUtf8Slice
+    var supportsInlineScriptMetaEditing: UInt8
+    var isFileLocked: UInt8
+    var isReadOnly: UInt8
+    var canEditScriptMeta: UInt8
+    var canAppendScriptMeta: UInt8
+    var scriptMetaEditState: SmkPolicyUtf8Slice
+
+    init(
+        isSupportedScriptPath: UInt8 = 0,
+        runtimeKind: SmkPolicyUtf8Slice = SmkPolicyUtf8Slice(),
+        shebang: SmkPolicyUtf8Slice = SmkPolicyUtf8Slice(),
+        commentSyntax: SmkPolicyUtf8Slice = SmkPolicyUtf8Slice(),
+        supportsInlineScriptMetaEditing: UInt8 = 0,
+        isFileLocked: UInt8 = 0,
+        isReadOnly: UInt8 = 0,
+        canEditScriptMeta: UInt8 = 0,
+        canAppendScriptMeta: UInt8 = 0,
+        scriptMetaEditState: SmkPolicyUtf8Slice = SmkPolicyUtf8Slice()
+    ) {
+        self.isSupportedScriptPath = isSupportedScriptPath
+        self.runtimeKind = runtimeKind
+        self.shebang = shebang
+        self.commentSyntax = commentSyntax
+        self.supportsInlineScriptMetaEditing = supportsInlineScriptMetaEditing
+        self.isFileLocked = isFileLocked
+        self.isReadOnly = isReadOnly
+        self.canEditScriptMeta = canEditScriptMeta
+        self.canAppendScriptMeta = canAppendScriptMeta
+        self.scriptMetaEditState = scriptMetaEditState
+    }
+}
+
+@_silgen_name("smk_supported_script_extensions")
+private nonisolated func smk_supported_script_extensions(
+    _ outExtensions: UnsafeMutablePointer<SmkPolicyUtf8Slice>
+) -> Int32
+
+@_silgen_name("smk_inspect_script_file_path")
+private nonisolated func smk_inspect_script_file_path(
+    _ path: SmkPolicyUtf8Slice,
+    _ outInspection: UnsafeMutablePointer<SmkPolicyScriptFileInspection>
+) -> Int32
+
+@_silgen_name("smk_script_path_may_affect_metadata")
+private nonisolated func smk_script_path_may_affect_metadata(
+    _ path: SmkPolicyUtf8Slice,
+    _ outMayAffect: UnsafeMutablePointer<UInt8>
+) -> Int32
+
+public nonisolated struct ScriptMetaScriptFileInspection: Codable, Equatable, Sendable {
+    public var isSupportedScriptPath: Bool
+    public var runtimeKind: String?
+    public var shebang: String?
+    public var commentSyntax: String?
+    public var supportsInlineScriptMetaEditing: Bool
+    public var isFileLocked: Bool
+    public var isReadOnly: Bool
+    public var canEditScriptMeta: Bool
+    public var canAppendScriptMeta: Bool
+    public var scriptMetaEditState: String
+
+    public init(
+        isSupportedScriptPath: Bool = false,
+        runtimeKind: String? = nil,
+        shebang: String? = nil,
+        commentSyntax: String? = nil,
+        supportsInlineScriptMetaEditing: Bool = false,
+        isFileLocked: Bool = false,
+        isReadOnly: Bool = false,
+        canEditScriptMeta: Bool = false,
+        canAppendScriptMeta: Bool = false,
+        scriptMetaEditState: String = "unknown"
+    ) {
+        self.isSupportedScriptPath = isSupportedScriptPath
+        self.runtimeKind = runtimeKind
+        self.shebang = shebang
+        self.commentSyntax = commentSyntax
+        self.supportsInlineScriptMetaEditing = supportsInlineScriptMetaEditing
+        self.isFileLocked = isFileLocked
+        self.isReadOnly = isReadOnly
+        self.canEditScriptMeta = canEditScriptMeta
+        self.canAppendScriptMeta = canAppendScriptMeta
+        self.scriptMetaEditState = scriptMetaEditState
+    }
+}
+
+public nonisolated enum ScriptMetaScriptFilePolicy {
+    public static let supportedPathExtensions: Set<String> = {
+        var extensions = SmkPolicyUtf8Slice()
+        guard smk_supported_script_extensions(&extensions) == smkPolicyStatusOK else {
+            return []
+        }
+        return Set(string(extensions).split(separator: "\n").map(String.init))
+    }()
+
+    public static func inspect(_ url: URL) -> ScriptMetaScriptFileInspection {
+        var inspection = SmkPolicyScriptFileInspection()
+        let status = withUTF8Slice(url.standardizedFileURL.path) { pathSlice in
+            smk_inspect_script_file_path(pathSlice, &inspection)
+        }
+        guard status == smkPolicyStatusOK else {
+            return ScriptMetaScriptFileInspection()
+        }
+        return ScriptMetaScriptFileInspection(
+            isSupportedScriptPath: inspection.isSupportedScriptPath != 0,
+            runtimeKind: optionalString(inspection.runtimeKind),
+            shebang: optionalString(inspection.shebang),
+            commentSyntax: optionalString(inspection.commentSyntax),
+            supportsInlineScriptMetaEditing: inspection.supportsInlineScriptMetaEditing != 0,
+            isFileLocked: inspection.isFileLocked != 0,
+            isReadOnly: inspection.isReadOnly != 0,
+            canEditScriptMeta: inspection.canEditScriptMeta != 0,
+            canAppendScriptMeta: inspection.canAppendScriptMeta != 0,
+            scriptMetaEditState: optionalString(inspection.scriptMetaEditState) ?? "unknown"
+        )
+    }
+
+    public static func isSupportedScriptPath(_ url: URL) -> Bool {
+        inspect(url).isSupportedScriptPath
+    }
+
+    public static func runtimeKind(for url: URL) -> String? {
+        inspect(url).runtimeKind
+    }
+
+    public static func supportsInlineScriptMetaEditing(_ url: URL) -> Bool {
+        inspect(url).supportsInlineScriptMetaEditing
+    }
+
+    public static func scriptMetaEditState(for url: URL) -> String {
+        inspect(url).scriptMetaEditState
+    }
+
+    public static func commentStyle(for url: URL) -> String? {
+        inspect(url).commentSyntax
+    }
+
+    public static func changedPathMayAffectMetadata(_ changedPath: String) -> Bool {
+        var mayAffect: UInt8 = 0
+        let status = withUTF8Slice(changedPath) { pathSlice in
+            smk_script_path_may_affect_metadata(pathSlice, &mayAffect)
+        }
+        return status == smkPolicyStatusOK && mayAffect != 0
+    }
+
+    private static func withUTF8Slice<Result>(
+        _ value: String,
+        _ body: (SmkPolicyUtf8Slice) -> Result
+    ) -> Result {
+        var mutableValue = value
+        return mutableValue.withUTF8 { buffer in
+            body(SmkPolicyUtf8Slice(ptr: buffer.baseAddress, len: buffer.count))
+        }
+    }
+
+    private static func optionalString(_ slice: SmkPolicyUtf8Slice) -> String? {
+        let value = string(slice)
+        return value.isEmpty ? nil : value
+    }
+
+    private static func string(_ slice: SmkPolicyUtf8Slice) -> String {
+        guard let ptr = slice.ptr, slice.len > 0 else { return "" }
+        return String(decoding: UnsafeBufferPointer(start: ptr, count: slice.len), as: UTF8.self)
+    }
+}
+
 public nonisolated enum ScriptMetaScanMode: UInt32, Codable, Sendable {
     case fileListOnly = 0
     case metadataOnly = 1
@@ -25,6 +208,13 @@ public nonisolated enum ScriptMetaCachePolicy: UInt32, Codable, Sendable {
     case memoryOnly = 1
     case persistentCatalogOnly = 2
     case memoryAndPersistent = 3
+}
+
+public nonisolated enum ScriptMetaCacheScope: UInt32, Codable, Sendable {
+    case all = 0
+    case catalog = 1
+    case fileList = 2
+    case root = 3
 }
 
 public nonisolated enum ScriptMetaRefreshPolicy: UInt32, Codable, Sendable {
@@ -88,7 +278,7 @@ public nonisolated struct ScriptMetaRootPreflightOptions: Codable, Sendable, Equ
         rejectTrashRoots: Bool = true,
         rejectRestrictedRoots: Bool = true,
         rejectLowScriptDensityLargeRoots: Bool = true,
-        maxScannedItems: Int = 5_000,
+        maxScannedItems: Int = 10_000,
         maxDurationMillis: UInt64 = 1_000,
         minScannedFileCountForLargeRoot: Int = 1_000,
         minScriptRatioDenominator: Int = 100,
@@ -277,6 +467,7 @@ public nonisolated struct FileSystemEntry: Codable, Identifiable, Sendable {
     public var canEditScriptMeta: Bool
     public var canAppendScriptMeta: Bool
     public var scriptMetaEditState: String
+    public var scriptMetaItem: ScriptMetaItem?
     public var children: [FileSystemEntry]
 
     public var id: String { displayPath }
@@ -303,6 +494,7 @@ public nonisolated struct FileSystemEntry: Codable, Identifiable, Sendable {
         case canEditScriptMeta = "can_edit_scriptmeta"
         case canAppendScriptMeta = "can_append_scriptmeta"
         case scriptMetaEditState = "scriptmeta_edit_state"
+        case scriptMetaItem = "scriptmeta_item"
         case children
     }
 
@@ -535,6 +727,7 @@ public nonisolated struct CandidateRecord: Codable, Sendable {
         case contentModifiedAt = "content_modified_at"
         case item
     }
+
 }
 
 public nonisolated struct ScriptMetaItem: Codable, Identifiable, Sendable {
@@ -587,6 +780,54 @@ public nonisolated struct ScriptMetaItem: Codable, Identifiable, Sendable {
         case canEditScriptMeta = "can_edit_scriptmeta"
         case canAppendScriptMeta = "can_append_scriptmeta"
         case scriptMetaEditState = "scriptmeta_edit_state"
+    }
+
+    public init(
+        rootID: String,
+        filePath: String,
+        identityPath: String,
+        runtimeKind: String? = nil,
+        shebang: String? = nil,
+        scriptID: String,
+        version: String? = nil,
+        itemDescription: String? = nil,
+        targetApp: String? = nil,
+        minTargetVersion: String? = nil,
+        metaURL: String? = nil,
+        name: String? = nil,
+        author: String? = nil,
+        releaseDate: String? = nil,
+        editPasswordSHA256: String? = nil,
+        hasScriptMeta: Bool = true,
+        hasScriptMetaEditPassword: Bool = false,
+        isFileLocked: Bool = false,
+        isReadOnly: Bool = false,
+        canEditScriptMeta: Bool = true,
+        canAppendScriptMeta: Bool = true,
+        scriptMetaEditState: String = "editable"
+    ) {
+        self.rootID = rootID
+        self.filePath = filePath
+        self.identityPath = identityPath
+        self.runtimeKind = runtimeKind
+        self.shebang = shebang
+        self.scriptID = scriptID
+        self.version = version
+        self.itemDescription = itemDescription
+        self.targetApp = targetApp
+        self.minTargetVersion = minTargetVersion
+        self.metaURL = metaURL
+        self.name = name
+        self.author = author
+        self.releaseDate = releaseDate
+        self.editPasswordSHA256 = editPasswordSHA256
+        self.hasScriptMeta = hasScriptMeta
+        self.hasScriptMetaEditPassword = hasScriptMetaEditPassword
+        self.isFileLocked = isFileLocked
+        self.isReadOnly = isReadOnly
+        self.canEditScriptMeta = canEditScriptMeta
+        self.canAppendScriptMeta = canAppendScriptMeta
+        self.scriptMetaEditState = scriptMetaEditState
     }
 }
 
@@ -900,6 +1141,7 @@ public nonisolated struct ScriptMetaBackupRecord: Codable, Identifiable, Sendabl
     public var id: String
     public var createdAtMillis: UInt64
     public var backupFileName: String
+    public var backupFilePath: String
     public var fileSize: UInt64
     public var reason: ScriptMetaBackupReason
 
@@ -907,6 +1149,7 @@ public nonisolated struct ScriptMetaBackupRecord: Codable, Identifiable, Sendabl
         case id
         case createdAtMillis = "created_at_millis"
         case backupFileName = "backup_file_name"
+        case backupFilePath = "backup_file_path"
         case fileSize = "file_size"
         case reason
     }
@@ -956,6 +1199,26 @@ public nonisolated struct ScriptIdUniquenessReport: Codable, Sendable {
     }
 
     public var isUnique: Bool { duplicates.isEmpty }
+}
+
+public nonisolated struct ScriptIdUniquenessItem: Codable, Identifiable, Sendable {
+    public var itemID: String
+    public var filePath: String
+    public var scriptID: String
+
+    public var id: String { itemID }
+
+    enum CodingKeys: String, CodingKey {
+        case itemID = "item_id"
+        case filePath = "file_path"
+        case scriptID = "script_id"
+    }
+
+    public init(itemID: String, filePath: String, scriptID: String) {
+        self.itemID = itemID
+        self.filePath = filePath
+        self.scriptID = scriptID
+    }
 }
 
 public nonisolated struct ScriptIdDuplicate: Codable, Identifiable, Sendable {

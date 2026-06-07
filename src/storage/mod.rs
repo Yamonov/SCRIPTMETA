@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     fs::{self, File},
-    io::{BufReader, BufWriter},
-    path::Path,
+    io::{BufReader, BufWriter, Write},
+    path::{Path, PathBuf},
 };
 
 use crate::{
@@ -158,12 +158,32 @@ pub fn save_cache_payload(
         })?;
     }
 
-    let file = File::create(path).map_err(|error| ScriptMetaKitError::Io {
-        path: path.to_path_buf(),
+    let temp_path = temporary_cache_path(path);
+    let mut temp_guard = TemporaryCacheFile::new(temp_path.clone());
+    let file = File::create(&temp_path).map_err(|error| ScriptMetaKitError::Io {
+        path: temp_path.clone(),
         message: error.to_string(),
     })?;
-    serde_json::to_writer_pretty(BufWriter::new(file), payload)
-        .map_err(|error| ScriptMetaKitError::Cache(error.to_string()))
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, payload)
+        .map_err(|error| ScriptMetaKitError::Cache(error.to_string()))?;
+    writer.flush().map_err(|error| ScriptMetaKitError::Io {
+        path: temp_path.clone(),
+        message: error.to_string(),
+    })?;
+    let file = writer
+        .into_inner()
+        .map_err(|error| ScriptMetaKitError::Io {
+            path: temp_path.clone(),
+            message: error.to_string(),
+        })?;
+    file.sync_all().map_err(|error| ScriptMetaKitError::Io {
+        path: temp_path.clone(),
+        message: error.to_string(),
+    })?;
+    replace_cache_file(&temp_path, path)?;
+    temp_guard.disarm();
+    Ok(())
 }
 
 pub fn load_cache_payload(path: impl AsRef<Path>) -> ScriptMetaKitResult<CachePayload> {
@@ -175,4 +195,87 @@ pub fn load_cache_payload(path: impl AsRef<Path>) -> ScriptMetaKitResult<CachePa
     let payload: CachePayload = serde_json::from_reader(BufReader::new(file))
         .map_err(|error| ScriptMetaKitError::Cache(error.to_string()))?;
     payload.migrate()
+}
+
+fn temporary_cache_path(path: &Path) -> PathBuf {
+    let mut file_name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    file_name.push(format!(
+        ".tmp.{}.{}",
+        std::process::id(),
+        now_timestamp_millis()
+    ));
+    path.with_file_name(file_name)
+}
+
+struct TemporaryCacheFile {
+    path: PathBuf,
+    cleanup: bool,
+}
+
+impl TemporaryCacheFile {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            cleanup: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.cleanup = false;
+    }
+}
+
+impl Drop for TemporaryCacheFile {
+    fn drop(&mut self) {
+        if self.cleanup {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn replace_cache_file(temp_path: &Path, destination: &Path) -> ScriptMetaKitResult<()> {
+    fs::rename(temp_path, destination).map_err(|error| ScriptMetaKitError::Io {
+        path: destination.to_path_buf(),
+        message: error.to_string(),
+    })
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn replace_cache_file(temp_path: &Path, destination: &Path) -> ScriptMetaKitResult<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let temp_path_wide = temp_path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let destination_wide = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // SAFETY: the UTF-16 buffers are null-terminated and remain alive for the
+    // duration of the call. MoveFileExW does not retain the pointers.
+    let moved = unsafe {
+        MoveFileExW(
+            temp_path_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(ScriptMetaKitError::Io {
+            path: destination.to_path_buf(),
+            message: std::io::Error::last_os_error().to_string(),
+        });
+    }
+    Ok(())
 }

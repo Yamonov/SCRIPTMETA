@@ -10,6 +10,11 @@ use crate::{
     watcher::normalize_path,
 };
 
+#[must_use]
+pub fn can_read_directory_contents(path: &Path) -> bool {
+    fs::read_dir(path).is_ok()
+}
+
 pub(crate) fn root_location_issue(
     root_path: &Path,
     options: &ScannerOptions,

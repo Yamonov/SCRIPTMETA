@@ -2879,11 +2879,14 @@ fn scan_result_reports_operation_summary_and_file_issues() {
         scriptmetakit::OperationStatus::Finished
     );
     assert_eq!(result.operation.total_units, 1);
-    assert!(
-        result
-            .file_issues
-            .iter()
-            .any(|issue| issue.path == obfuscated_path && issue.code == "binary_or_obfuscated")
+    let entries = result.file_list_snapshots[0]
+        .children
+        .as_deref()
+        .unwrap_or_default();
+    let obfuscated_entry = find_file_entry(entries, &obfuscated_path).expect("obfuscated entry");
+    assert_eq!(
+        obfuscated_entry.scriptmeta_edit_state,
+        scriptmetakit::ScriptMetaEditState::Obfuscated
     );
     assert!(
         result
