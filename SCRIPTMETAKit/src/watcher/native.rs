@@ -365,7 +365,7 @@ mod platform {
         os::raw::c_char,
         path::PathBuf,
         ptr,
-        sync::mpsc,
+        sync::{Arc, Mutex, mpsc},
         thread::{self, JoinHandle},
     };
 
@@ -376,7 +376,8 @@ mod platform {
 
     pub struct PlatformWatcher {
         paths: cf::CFMutableArrayRef,
-        run_loop: Option<CFSendWrapper>,
+        run_loop: Arc<Mutex<Option<CFSendWrapper>>>,
+        stop_sender: Option<mpsc::Sender<()>>,
         worker: Option<JoinHandle<()>>,
     }
 
@@ -387,6 +388,16 @@ mod platform {
     struct CFSendWrapper(usize);
 
     unsafe impl Send for CFSendWrapper {}
+
+    const RUN_LOOP_TICK_SECONDS: cf::CFTimeInterval = 0.25;
+
+    unsafe extern "C" {
+        fn CFRunLoopRunInMode(
+            mode: cf::CFStringRef,
+            seconds: cf::CFTimeInterval,
+            return_after_source_handled: cf::Boolean,
+        ) -> i32;
+    }
 
     impl PlatformWatcher {
         pub fn start(
@@ -405,13 +416,19 @@ mod platform {
             if plan.physical_roots.is_empty() {
                 return Ok(Self {
                     paths,
-                    run_loop: None,
+                    run_loop: Arc::new(Mutex::new(None)),
+                    stop_sender: None,
                     worker: None,
                 });
             }
 
             for root in &plan.physical_roots {
-                append_watch_path(paths, &root.path)?;
+                if let Err(error) = append_watch_path(paths, &root.path) {
+                    unsafe {
+                        cf::CFRelease(paths);
+                    }
+                    return Err(error);
+                }
             }
 
             let context = Box::into_raw(Box::new(StreamContext {
@@ -426,13 +443,15 @@ mod platform {
             };
 
             let stream = unsafe {
+                let native_event_latency_seconds =
+                    plan.native_event_latency_millis as f64 / 1_000.0;
                 fs::FSEventStreamCreate(
                     cf::kCFAllocatorDefault,
                     callback,
                     &stream_context,
                     paths,
                     fs::kFSEventStreamEventIdSinceNow,
-                    0.0,
+                    native_event_latency_seconds,
                     fs::kFSEventStreamCreateFlagFileEvents | fs::kFSEventStreamCreateFlagNoDefer,
                 )
             };
@@ -447,48 +466,86 @@ mod platform {
                 ));
             }
 
-            let stream = CFSendWrapper(stream as usize);
-            let (run_loop_sender, run_loop_receiver) = mpsc::channel();
-            let worker = thread::Builder::new()
+            let raw_stream = stream;
+            let stream = CFSendWrapper(raw_stream as usize);
+            let run_loop = Arc::new(Mutex::new(None));
+            let worker_run_loop = Arc::clone(&run_loop);
+            let (stop_sender, stop_receiver) = mpsc::channel();
+            let (start_sender, start_receiver) = mpsc::sync_channel(1);
+            let worker = match thread::Builder::new()
                 .name("scriptmetakit-fsevents".to_string())
                 .spawn(move || {
                     let stream = stream.0 as fs::FSEventStreamRef;
                     unsafe {
                         let run_loop = cf::CFRunLoopGetCurrent();
+                        if let Ok(mut stored_run_loop) = worker_run_loop.lock() {
+                            *stored_run_loop = Some(CFSendWrapper(run_loop as usize));
+                        }
                         fs::FSEventStreamScheduleWithRunLoop(
                             stream,
                             run_loop,
                             cf::kCFRunLoopDefaultMode,
                         );
                         let started = fs::FSEventStreamStart(stream) != 0;
-                        let _ = run_loop_sender
-                            .send(started.then_some(CFSendWrapper(run_loop as usize)));
                         if started {
-                            cf::CFRunLoopRun();
+                            let _ = start_sender.send(Ok(()));
+                            loop {
+                                match stop_receiver.try_recv() {
+                                    Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
+                                    Err(mpsc::TryRecvError::Empty) => {}
+                                }
+                                CFRunLoopRunInMode(
+                                    cf::kCFRunLoopDefaultMode,
+                                    RUN_LOOP_TICK_SECONDS,
+                                    1,
+                                );
+                            }
+                        } else {
+                            let _ = start_sender
+                                .send(Err("failed to start FSEvents stream".to_string()));
+                        }
+                        if started {
                             fs::FSEventStreamStop(stream);
                         }
                         fs::FSEventStreamInvalidate(stream);
                         fs::FSEventStreamRelease(stream);
+                        if let Ok(mut stored_run_loop) = worker_run_loop.lock() {
+                            *stored_run_loop = None;
+                        }
                     }
-                })
-                .map_err(|error| ScriptMetaKitError::InvalidConfig(error.to_string()))?;
-
-            let run_loop = run_loop_receiver
-                .recv()
-                .map_err(|error| ScriptMetaKitError::InvalidConfig(error.to_string()))?;
-            let Some(run_loop) = run_loop else {
-                let _ = worker.join();
-                unsafe {
-                    cf::CFRelease(paths);
+                }) {
+                Ok(worker) => worker,
+                Err(error) => {
+                    unsafe {
+                        fs::FSEventStreamRelease(raw_stream);
+                        cf::CFRelease(paths);
+                    }
+                    return Err(ScriptMetaKitError::InvalidConfig(error.to_string()));
                 }
-                return Err(ScriptMetaKitError::InvalidConfig(
-                    "failed to start FSEvents stream".to_string(),
-                ));
             };
+
+            match start_receiver.recv() {
+                Ok(Ok(())) => {}
+                Ok(Err(message)) => {
+                    let _ = worker.join();
+                    unsafe {
+                        cf::CFRelease(paths);
+                    }
+                    return Err(ScriptMetaKitError::InvalidConfig(message));
+                }
+                Err(error) => {
+                    let _ = worker.join();
+                    unsafe {
+                        cf::CFRelease(paths);
+                    }
+                    return Err(ScriptMetaKitError::InvalidConfig(error.to_string()));
+                }
+            }
 
             Ok(Self {
                 paths,
-                run_loop: Some(run_loop),
+                run_loop,
+                stop_sender: Some(stop_sender),
                 worker: Some(worker),
             })
         }
@@ -496,7 +553,12 @@ mod platform {
 
     impl Drop for PlatformWatcher {
         fn drop(&mut self) {
-            if let Some(run_loop) = self.run_loop.take() {
+            if let Some(stop_sender) = self.stop_sender.take() {
+                let _ = stop_sender.send(());
+            }
+            if let Ok(mut stored_run_loop) = self.run_loop.lock()
+                && let Some(run_loop) = stored_run_loop.take()
+            {
                 unsafe {
                     cf::CFRunLoopStop(run_loop.0 as cf::CFRunLoopRef);
                 }
@@ -653,12 +715,19 @@ mod platform {
             let mut workers = Vec::new();
 
             for root in &plan.physical_roots {
-                let directory = open_directory(&root.path)?;
+                let directory = match open_directory(&root.path) {
+                    Ok(directory) => directory,
+                    Err(error) => {
+                        stop_workers(&mut stop_events, &mut workers);
+                        return Err(error);
+                    }
+                };
                 let stop_event = unsafe { CreateEventW(ptr::null(), TRUE, FALSE, ptr::null()) };
                 if stop_event.is_null() || stop_event == INVALID_HANDLE_VALUE {
                     unsafe {
                         CloseHandle(directory);
                     }
+                    stop_workers(&mut stop_events, &mut workers);
                     return Err(ScriptMetaKitError::Io {
                         path: root.path.clone(),
                         message: "failed to create Windows watcher stop event".to_string(),
@@ -679,7 +748,14 @@ mod platform {
                             sender,
                         );
                     })
-                    .map_err(|error| ScriptMetaKitError::InvalidConfig(error.to_string()))?;
+                    .map_err(|error| {
+                        unsafe {
+                            CloseHandle(stop_event);
+                            CloseHandle(directory);
+                        }
+                        stop_workers(&mut stop_events, &mut workers);
+                        ScriptMetaKitError::InvalidConfig(error.to_string())
+                    })?;
 
                 stop_events.push(stop_event as isize);
                 workers.push(worker);
@@ -694,18 +770,22 @@ mod platform {
 
     impl Drop for PlatformWatcher {
         fn drop(&mut self) {
-            for stop_event in &self.stop_events {
-                unsafe {
-                    SetEvent(*stop_event as HANDLE);
-                }
+            stop_workers(&mut self.stop_events, &mut self.workers);
+        }
+    }
+
+    fn stop_workers(stop_events: &mut Vec<isize>, workers: &mut Vec<JoinHandle<()>>) {
+        for stop_event in stop_events.iter() {
+            unsafe {
+                SetEvent(*stop_event as HANDLE);
             }
-            for worker in self.workers.drain(..) {
-                let _ = worker.join();
-            }
-            for stop_event in self.stop_events.drain(..) {
-                unsafe {
-                    CloseHandle(stop_event as HANDLE);
-                }
+        }
+        for worker in workers.drain(..) {
+            let _ = worker.join();
+        }
+        for stop_event in stop_events.drain(..) {
+            unsafe {
+                CloseHandle(stop_event as HANDLE);
             }
         }
     }

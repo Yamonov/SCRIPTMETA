@@ -2,8 +2,10 @@ use std::{collections::BTreeSet, path::Path};
 
 use serde::{Deserialize, Serialize};
 
+use crate::formats::DEFAULT_SCRIPT_EXTENSIONS;
+
 pub const DEFAULT_SCAN_TIMEOUT_PER_ROOT_MILLIS: u64 = 30_000;
-pub const DEFAULT_ROOT_PREFLIGHT_MAX_SCANNED_ITEMS: usize = 5_000;
+pub const DEFAULT_ROOT_PREFLIGHT_MAX_SCANNED_ITEMS: usize = 10_000;
 pub const DEFAULT_ROOT_PREFLIGHT_MAX_DURATION_MILLIS: u64 = 1_000;
 pub const DEFAULT_ROOT_PREFLIGHT_MIN_SCANNED_FILE_COUNT_FOR_LARGE_ROOT: usize = 1_000;
 pub const DEFAULT_ROOT_PREFLIGHT_MIN_SCRIPT_RATIO_DENOMINATOR: usize = 100;
@@ -32,18 +34,7 @@ impl ExtensionPolicy {
 
     #[must_use]
     pub fn script_default() -> Self {
-        Self::new([
-            "js",
-            "jsx",
-            "jsxbin",
-            "jsxinc",
-            "scpt",
-            "scptd",
-            "applescript",
-            "jxa",
-            "idjs",
-            "psjs",
-        ])
+        Self::new(DEFAULT_SCRIPT_EXTENSIONS.iter().copied())
     }
 
     #[must_use]

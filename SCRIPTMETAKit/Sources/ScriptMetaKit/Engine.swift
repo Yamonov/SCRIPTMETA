@@ -16,8 +16,27 @@ public nonisolated enum ScriptMetaKitError: LocalizedError {
 
 public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
     private let engineBox = ScriptMetaKitFFIEngineBox()
+    private static let operationPriority: TaskPriority = .utility
 
     public init() {}
+
+    public static func validateScriptIDUniqueness(
+        in items: [ScriptIdUniquenessItem]
+    ) throws -> ScriptIdUniquenessReport {
+        try validateScriptIDUniquenessViaFFI(in: items)
+    }
+
+    public static func validateScriptIDUniqueness(in items: [ScriptMetaItem]) throws -> ScriptIdUniquenessReport {
+        try validateScriptIDUniqueness(
+            in: items.map {
+                ScriptIdUniquenessItem(
+                    itemID: $0.filePath,
+                    filePath: $0.filePath,
+                    scriptID: $0.scriptID
+                )
+            }
+        )
+    }
 
     public func scan(folderURL: URL, checkUpdates: Bool) async throws -> ScriptMetaScanResult {
         try await scan(folderURLs: [folderURL], checkUpdates: checkUpdates)
@@ -28,7 +47,7 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         checkUpdates: Bool,
         onProgress: (@Sendable (UpdateCheckProgress) -> Void)? = nil
     ) async throws -> ScriptMetaScanResult {
-        try await Task.detached(priority: .utility) { [engineBox] in
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
             try engineBox.scan(folderURLs: folderURLs, checkUpdates: checkUpdates, onProgress: onProgress)
         }.value
     }
@@ -37,19 +56,31 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         item: ScriptMetaItem,
         onProgress: (@Sendable (UpdateCheckProgress) -> Void)? = nil
     ) async throws -> UpdateCheckResult {
-        try await Task.detached(priority: .utility) { [engineBox] in
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
             try engineBox.checkUpdate(item: item, onProgress: onProgress)
         }.value
     }
 
     public func setRoots(_ roots: [ScriptMetaKitRoot]) async throws {
-        try await Task.detached(priority: .utility) { [engineBox] in
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
             try engineBox.setRoots(roots)
         }.value
     }
 
+    public func replaceRootGroup(_ roots: [ScriptMetaKitRoot], groupID: String) async throws {
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+            try engineBox.replaceRootGroup(roots, groupID: groupID)
+        }.value
+    }
+
+    public func insertRootsIntoGroup(_ roots: [ScriptMetaKitRoot], groupID: String) async throws {
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+            try engineBox.insertRootsIntoGroup(roots, groupID: groupID)
+        }.value
+    }
+
     public func setVisibleRoot(_ rootID: String?) async throws {
-        try await Task.detached(priority: .utility) { [engineBox] in
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
             try engineBox.setVisibleRoot(rootID)
         }.value
     }
@@ -62,12 +93,18 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         engineBox.cancelCurrentOperation()
     }
 
+    public func shutdown() async {
+        await Task.detached(priority: Self.operationPriority) { [engineBox] in
+            engineBox.shutdown()
+        }.value
+    }
+
     public func scanRegisteredRoots(
         mode: ScriptMetaScanMode = .fileListAndMetadata,
         checkUpdates: Bool,
         onProgress: (@Sendable (UpdateCheckProgress) -> Void)? = nil
     ) async throws -> ScriptMetaScanResult {
-        try await Task.detached(priority: .utility) { [engineBox] in
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
             try engineBox.scanRegisteredRoots(mode: mode, checkUpdates: checkUpdates, onProgress: onProgress)
         }.value
     }
@@ -78,8 +115,17 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         checkUpdates: Bool,
         onProgress: (@Sendable (UpdateCheckProgress) -> Void)? = nil
     ) async throws -> ScriptMetaScanResult {
-        try await Task.detached(priority: .utility) { [engineBox] in
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
             try engineBox.scanRoots(rootIDs: rootIDs, mode: mode, checkUpdates: checkUpdates, onProgress: onProgress)
+        }.value
+    }
+
+    public func cachedRoots(
+        rootIDs: [String],
+        mode: ScriptMetaScanMode = .fileListAndMetadata
+    ) async throws -> ScriptMetaScanResult {
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+            try engineBox.cachedRoots(rootIDs: rootIDs, mode: mode)
         }.value
     }
 
@@ -93,38 +139,56 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
     }
 
     public func startWatching(onChange: @escaping @Sendable () -> Void) async throws {
-        try await Task.detached(priority: .utility) { [engineBox] in
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
             try engineBox.startWatching(onChange: onChange)
         }.value
     }
 
     public func startWatching(folderURLs: [URL], onChange: @escaping @Sendable () -> Void) async throws {
-        try await Task.detached(priority: .utility) { [engineBox] in
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
             try engineBox.startWatching(folderURLs: folderURLs, onChange: onChange)
         }.value
     }
 
     public func stopWatching() async {
-        await Task.detached(priority: .utility) { [engineBox] in
+        await Task.detached(priority: Self.operationPriority) { [engineBox] in
             engineBox.stopWatching()
         }.value
     }
 
     public func setResolveMacOSAlias(_ enabled: Bool) async throws {
-        try await Task.detached(priority: .utility) { [engineBox] in
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
             try engineBox.setResolveMacOSAlias(enabled)
         }.value
     }
 
     public func setDecompileCompiledOSADuringScan(_ enabled: Bool) async throws {
-        try await Task.detached(priority: .utility) { [engineBox] in
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
             try engineBox.setDecompileCompiledOSADuringScan(enabled)
         }.value
     }
 
+    public func setNativeEventLatencyMillis(_ latencyMillis: UInt64) async throws {
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+            try engineBox.setNativeEventLatencyMillis(latencyMillis)
+        }.value
+    }
+
     public func setRootPreflightOptions(_ options: ScriptMetaRootPreflightOptions) async throws {
-        try await Task.detached(priority: .utility) { [engineBox] in
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
             try engineBox.setRootPreflightOptions(options)
+        }.value
+    }
+
+    public func loadCache(from fileURL: URL) async throws {
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+            try engineBox.loadCache(from: fileURL)
+        }.value
+    }
+
+    public func saveCache(to fileURL: URL, scope: ScriptMetaCacheScope = .all) async throws {
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
+            try engineBox.saveCache(to: fileURL, scope: scope)
         }.value
     }
 
@@ -134,7 +198,7 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         mode: ScriptMetaWriteMode = .insertOrReplace,
         backupRootURL: URL? = nil
     ) async throws -> ScriptMetadataFileWriteResult {
-        try await Task.detached(priority: .utility) { [engineBox] in
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
             try engineBox.writeScriptMetadata(
                 fileURL: fileURL,
                 draft: draft,
@@ -145,7 +209,7 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
     }
 
     public func readScriptMetadataDraft(fileURL: URL) async throws -> ScriptMetadataEditReadResult {
-        try await Task.detached(priority: .utility) { [engineBox] in
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
             try engineBox.readScriptMetadataDraft(fileURL: fileURL)
         }.value
     }
@@ -154,25 +218,25 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         fileURL: URL,
         maxBytes: Int = 8 * 1024
     ) async throws -> ScriptMetadataEditPreviewResult {
-        try await Task.detached(priority: .utility) { [engineBox] in
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
             try engineBox.readScriptMetadataEditPreview(fileURL: fileURL, maxBytes: maxBytes)
         }.value
     }
 
     public func renderDistributionMetadata(records: [DistributionMetadataDraft]) async throws -> String {
-        try await Task.detached(priority: .utility) { [engineBox] in
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
             try engineBox.renderDistributionMetadata(records: records)
         }.value
     }
 
     public func generateEditPasswordSHA256(password: String) async throws -> String {
-        try await Task.detached(priority: .utility) { [engineBox] in
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
             try engineBox.generateEditPasswordSHA256(password: password)
         }.value
     }
 
     public func verifyEditPasswordSHA256(password: String, storedValue: String) async throws -> Bool {
-        try await Task.detached(priority: .utility) { [engineBox] in
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
             try engineBox.verifyEditPasswordSHA256(password: password, storedValue: storedValue)
         }.value
     }
@@ -181,7 +245,7 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         fileURL: URL,
         backupRootURL: URL
     ) async throws -> [ScriptMetaBackupGeneration] {
-        try await Task.detached(priority: .utility) { [engineBox] in
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
             try engineBox.scriptMetaBackupGenerations(fileURL: fileURL, backupRootURL: backupRootURL)
         }.value
     }
@@ -191,7 +255,7 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         backupRootURL: URL,
         reason: ScriptMetaBackupReason = .beforeSave
     ) async throws -> ScriptMetaBackupRecord {
-        try await Task.detached(priority: .utility) { [engineBox] in
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
             try engineBox.createScriptMetaBackup(fileURL: fileURL, backupRootURL: backupRootURL, reason: reason)
         }.value
     }
@@ -201,7 +265,7 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         backupRootURL: URL,
         generationID: String
     ) async throws -> ScriptMetaBackupRecord {
-        try await Task.detached(priority: .utility) { [engineBox] in
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
             try engineBox.restoreScriptMetaBackup(
                 fileURL: fileURL,
                 backupRootURL: backupRootURL,
@@ -211,7 +275,7 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
     }
 
     public func clearScriptMetaBackups(fileURL: URL, backupRootURL: URL) async throws {
-        try await Task.detached(priority: .utility) { [engineBox] in
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
             try engineBox.clearScriptMetaBackups(fileURL: fileURL, backupRootURL: backupRootURL)
         }.value
     }
@@ -220,7 +284,7 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         fileURL: URL,
         backupRootURL: URL
     ) async throws -> ScriptMetaBackupRecord {
-        try await Task.detached(priority: .utility) { [engineBox] in
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
             try engineBox.resetScriptMetaBackupsWithCurrentAsInitial(
                 fileURL: fileURL,
                 backupRootURL: backupRootURL
@@ -228,27 +292,12 @@ public nonisolated final class ScriptMetaKitEngine: @unchecked Sendable {
         }.value
     }
 
-    public func validateScriptIDUniqueness(in items: [ScriptMetaItem]) -> ScriptIdUniquenessReport {
-        let groups = Dictionary(grouping: items, by: \.scriptID)
-        let duplicates = groups
-            .filter { !$0.key.isEmpty && $0.value.count > 1 }
-            .sorted { $0.key < $1.key }
-            .map { scriptID, groupedItems in
-                ScriptIdDuplicate(
-                    scriptID: scriptID,
-                    itemIDs: groupedItems.map(\.id),
-                    filePaths: groupedItems.map(\.filePath)
-                )
-            }
-        return ScriptIdUniquenessReport(
-            totalItems: items.count,
-            uniqueScriptIDs: groups.keys.filter { !$0.isEmpty }.count,
-            duplicates: duplicates
-        )
+    public func validateScriptIDUniqueness(in items: [ScriptMetaItem]) throws -> ScriptIdUniquenessReport {
+        try Self.validateScriptIDUniqueness(in: items)
     }
 
     public func pollWatchChanges() async throws -> ScriptMetaScanResult? {
-        try await Task.detached(priority: .utility) { [engineBox] in
+        try await Task.detached(priority: Self.operationPriority) { [engineBox] in
             try engineBox.pollWatchChanges()
         }.value
     }
@@ -275,6 +324,30 @@ private nonisolated struct SmkRootRegistration {
     var cachePolicy: UInt32
     var refreshPolicy: UInt32
     var priority: UInt32
+}
+
+private nonisolated struct SmkRegisteredRootSignature {
+    var rootID: SmkUtf8Slice
+    var path: SmkUtf8Slice
+}
+
+private nonisolated struct SmkCatalogInfo {
+    var hasCatalog: UInt8
+    var sourceRevision: SmkUtf8Slice
+    var candidateCacheSchemaVersion: UInt32
+    var candidateCacheBuiltAt: UInt64
+
+    init(
+        hasCatalog: UInt8 = 0,
+        sourceRevision: SmkUtf8Slice = SmkUtf8Slice(),
+        candidateCacheSchemaVersion: UInt32 = 0,
+        candidateCacheBuiltAt: UInt64 = 0
+    ) {
+        self.hasCatalog = hasCatalog
+        self.sourceRevision = sourceRevision
+        self.candidateCacheSchemaVersion = candidateCacheSchemaVersion
+        self.candidateCacheBuiltAt = candidateCacheBuiltAt
+    }
 }
 
 private nonisolated struct SmkRootSnapshot {
@@ -323,6 +396,8 @@ private nonisolated struct SmkFileEntry {
     var canEditScriptMeta: UInt8
     var canAppendScriptMeta: UInt8
     var scriptMetaEditState: SmkUtf8Slice
+    var hasScriptMetaItem: UInt8
+    var scriptMetaItem: SmkScriptItem
     var firstChildIndex: Int
     var childCount: Int
 }
@@ -357,6 +432,31 @@ private nonisolated struct SmkScriptItem {
     var canEditScriptMeta: UInt8
     var canAppendScriptMeta: UInt8
     var scriptMetaEditState: SmkUtf8Slice
+}
+
+private nonisolated struct SmkCandidateRecord {
+    var rootID: SmkUtf8Slice
+    var rootPath: SmkUtf8Slice
+    var filePath: SmkUtf8Slice
+    var identityPath: SmkUtf8Slice
+    var pathKind: SmkUtf8Slice
+    var resolutionStatus: SmkUtf8Slice
+    var resolutionMessage: SmkUtf8Slice
+    var runtimeKind: SmkUtf8Slice
+    var shebang: SmkUtf8Slice
+    var hasScriptMeta: UInt8
+    var hasScriptMetaEditPassword: UInt8
+    var isFileLocked: UInt8
+    var isReadOnly: UInt8
+    var canEditScriptMeta: UInt8
+    var canAppendScriptMeta: UInt8
+    var scriptMetaEditState: SmkUtf8Slice
+    var hasFileSize: UInt8
+    var fileSize: UInt64
+    var hasContentModifiedAt: UInt8
+    var contentModifiedAt: UInt64
+    var hasItem: UInt8
+    var item: SmkScriptItem
 }
 
 private nonisolated struct SmkUpdateCheckInfo {
@@ -565,6 +665,16 @@ private nonisolated struct SmkRootSnapshotSlice {
     }
 }
 
+private nonisolated struct SmkRegisteredRootSignatureSlice {
+    var ptr: UnsafePointer<SmkRegisteredRootSignature>?
+    var len: Int
+
+    init(ptr: UnsafePointer<SmkRegisteredRootSignature>? = nil, len: Int = 0) {
+        self.ptr = ptr
+        self.len = len
+    }
+}
+
 private nonisolated struct SmkFileListSnapshotSlice {
     var ptr: UnsafePointer<SmkFileListSnapshot>?
     var len: Int
@@ -590,6 +700,76 @@ private nonisolated struct SmkScriptItemSlice {
     var len: Int
 
     init(ptr: UnsafePointer<SmkScriptItem>? = nil, len: Int = 0) {
+        self.ptr = ptr
+        self.len = len
+    }
+}
+
+private nonisolated struct SmkScriptIdUniquenessItem {
+    var itemID: SmkUtf8Slice
+    var filePath: SmkUtf8Slice
+    var scriptID: SmkUtf8Slice
+
+    init(
+        itemID: SmkUtf8Slice = SmkUtf8Slice(),
+        filePath: SmkUtf8Slice = SmkUtf8Slice(),
+        scriptID: SmkUtf8Slice = SmkUtf8Slice()
+    ) {
+        self.itemID = itemID
+        self.filePath = filePath
+        self.scriptID = scriptID
+    }
+}
+
+private nonisolated struct SmkScriptIdUniquenessReport {
+    var totalItems: Int
+    var uniqueScriptIDs: Int
+    var duplicateCount: Int
+
+    init(totalItems: Int = 0, uniqueScriptIDs: Int = 0, duplicateCount: Int = 0) {
+        self.totalItems = totalItems
+        self.uniqueScriptIDs = uniqueScriptIDs
+        self.duplicateCount = duplicateCount
+    }
+}
+
+private nonisolated struct SmkScriptIdDuplicate {
+    var scriptID: SmkUtf8Slice
+    var firstItemIDIndex: Int
+    var itemIDCount: Int
+    var firstFilePathIndex: Int
+    var filePathCount: Int
+
+    init(
+        scriptID: SmkUtf8Slice = SmkUtf8Slice(),
+        firstItemIDIndex: Int = 0,
+        itemIDCount: Int = 0,
+        firstFilePathIndex: Int = 0,
+        filePathCount: Int = 0
+    ) {
+        self.scriptID = scriptID
+        self.firstItemIDIndex = firstItemIDIndex
+        self.itemIDCount = itemIDCount
+        self.firstFilePathIndex = firstFilePathIndex
+        self.filePathCount = filePathCount
+    }
+}
+
+private nonisolated struct SmkScriptIdDuplicateSlice {
+    var ptr: UnsafePointer<SmkScriptIdDuplicate>?
+    var len: Int
+
+    init(ptr: UnsafePointer<SmkScriptIdDuplicate>? = nil, len: Int = 0) {
+        self.ptr = ptr
+        self.len = len
+    }
+}
+
+private nonisolated struct SmkCandidateRecordSlice {
+    var ptr: UnsafePointer<SmkCandidateRecord>?
+    var len: Int
+
+    init(ptr: UnsafePointer<SmkCandidateRecord>? = nil, len: Int = 0) {
         self.ptr = ptr
         self.len = len
     }
@@ -828,6 +1008,7 @@ private nonisolated struct SmkScriptMetaBackupRecord {
     var id: SmkUtf8Slice
     var createdAtMillis: UInt64
     var backupFileName: SmkUtf8Slice
+    var backupFilePath: SmkUtf8Slice
     var fileSize: UInt64
     var reason: SmkUtf8Slice
 
@@ -835,12 +1016,14 @@ private nonisolated struct SmkScriptMetaBackupRecord {
         id: SmkUtf8Slice = SmkUtf8Slice(),
         createdAtMillis: UInt64 = 0,
         backupFileName: SmkUtf8Slice = SmkUtf8Slice(),
+        backupFilePath: SmkUtf8Slice = SmkUtf8Slice(),
         fileSize: UInt64 = 0,
         reason: SmkUtf8Slice = SmkUtf8Slice()
     ) {
         self.id = id
         self.createdAtMillis = createdAtMillis
         self.backupFileName = backupFileName
+        self.backupFilePath = backupFilePath
         self.fileSize = fileSize
         self.reason = reason
     }
@@ -900,6 +1083,9 @@ private nonisolated func smk_engine_set_resolve_macos_alias(_ engine: OpaquePoin
 @_silgen_name("smk_engine_set_decompile_compiled_osa_during_scan")
 private nonisolated func smk_engine_set_decompile_compiled_osa_during_scan(_ engine: OpaquePointer?, _ enabled: UInt8) -> Int32
 
+@_silgen_name("smk_engine_set_native_event_latency_millis")
+private nonisolated func smk_engine_set_native_event_latency_millis(_ engine: OpaquePointer?, _ latencyMillis: UInt64) -> Int32
+
 @_silgen_name("smk_engine_set_root_preflight_options")
 private nonisolated func smk_engine_set_root_preflight_options(
     _ engine: OpaquePointer?,
@@ -919,6 +1105,22 @@ private nonisolated func smk_engine_cancel_current_operation(_ engine: OpaquePoi
 @_silgen_name("smk_engine_set_roots")
 private nonisolated func smk_engine_set_roots(
     _ engine: OpaquePointer?,
+    _ roots: UnsafePointer<SmkRootRegistration>?,
+    _ rootCount: Int
+) -> Int32
+
+@_silgen_name("smk_engine_replace_root_group")
+private nonisolated func smk_engine_replace_root_group(
+    _ engine: OpaquePointer?,
+    _ groupID: SmkUtf8Slice,
+    _ roots: UnsafePointer<SmkRootRegistration>?,
+    _ rootCount: Int
+) -> Int32
+
+@_silgen_name("smk_engine_insert_roots_into_group")
+private nonisolated func smk_engine_insert_roots_into_group(
+    _ engine: OpaquePointer?,
+    _ groupID: SmkUtf8Slice,
     _ roots: UnsafePointer<SmkRootRegistration>?,
     _ rootCount: Int
 ) -> Int32
@@ -977,6 +1179,15 @@ private nonisolated func smk_engine_scan_roots(
     _ outResult: UnsafeMutablePointer<OpaquePointer?>
 ) -> Int32
 
+@_silgen_name("smk_engine_cached_roots")
+private nonisolated func smk_engine_cached_roots(
+    _ engine: OpaquePointer?,
+    _ rootIDs: UnsafePointer<SmkUtf8Slice>?,
+    _ rootIDCount: Int,
+    _ scanMode: UInt32,
+    _ outResult: UnsafeMutablePointer<OpaquePointer?>
+) -> Int32
+
 @_silgen_name("smk_engine_scan_registered_roots_with_progress")
 private nonisolated func smk_engine_scan_registered_roots_with_progress(
     _ engine: OpaquePointer?,
@@ -1015,6 +1226,53 @@ private nonisolated func smk_engine_check_update_item_with_progress(
     _ outResult: UnsafeMutablePointer<OpaquePointer?>
 ) -> Int32
 
+@_silgen_name("smk_validate_script_id_uniqueness")
+private nonisolated func smk_validate_script_id_uniqueness(
+    _ items: UnsafePointer<SmkScriptIdUniquenessItem>?,
+    _ itemCount: Int,
+    _ outResult: UnsafeMutablePointer<OpaquePointer?>
+) -> Int32
+
+@_silgen_name("smk_script_id_uniqueness_result_report")
+private nonisolated func smk_script_id_uniqueness_result_report(
+    _ result: OpaquePointer?,
+    _ outReport: UnsafeMutablePointer<SmkScriptIdUniquenessReport>
+) -> Int32
+
+@_silgen_name("smk_script_id_uniqueness_result_duplicates")
+private nonisolated func smk_script_id_uniqueness_result_duplicates(
+    _ result: OpaquePointer?,
+    _ outDuplicates: UnsafeMutablePointer<SmkScriptIdDuplicateSlice>
+) -> Int32
+
+@_silgen_name("smk_script_id_uniqueness_result_item_ids")
+private nonisolated func smk_script_id_uniqueness_result_item_ids(
+    _ result: OpaquePointer?,
+    _ outItemIDs: UnsafeMutablePointer<SmkUtf8SliceSlice>
+) -> Int32
+
+@_silgen_name("smk_script_id_uniqueness_result_file_paths")
+private nonisolated func smk_script_id_uniqueness_result_file_paths(
+    _ result: OpaquePointer?,
+    _ outFilePaths: UnsafeMutablePointer<SmkUtf8SliceSlice>
+) -> Int32
+
+@_silgen_name("smk_script_id_uniqueness_result_free")
+private nonisolated func smk_script_id_uniqueness_result_free(_ result: OpaquePointer?)
+
+@_silgen_name("smk_engine_load_cache_file")
+private nonisolated func smk_engine_load_cache_file(
+    _ engine: OpaquePointer?,
+    _ cachePath: SmkUtf8Slice
+) -> Int32
+
+@_silgen_name("smk_engine_save_cache_file")
+private nonisolated func smk_engine_save_cache_file(
+    _ engine: OpaquePointer?,
+    _ scope: UInt32,
+    _ cachePath: SmkUtf8Slice
+) -> Int32
+
 @_silgen_name("smk_engine_start_watching")
 private nonisolated func smk_engine_start_watching(_ engine: OpaquePointer?) -> Int32
 
@@ -1038,6 +1296,15 @@ private nonisolated func smk_engine_poll_watcher_scan(
 @_silgen_name("smk_scan_result_roots")
 private nonisolated func smk_scan_result_roots(_ result: OpaquePointer?, _ outRoots: UnsafeMutablePointer<SmkRootSnapshotSlice>) -> Int32
 
+@_silgen_name("smk_scan_result_catalog_info")
+private nonisolated func smk_scan_result_catalog_info(_ result: OpaquePointer?, _ outInfo: UnsafeMutablePointer<SmkCatalogInfo>) -> Int32
+
+@_silgen_name("smk_scan_result_registered_root_signatures")
+private nonisolated func smk_scan_result_registered_root_signatures(
+    _ result: OpaquePointer?,
+    _ outRoots: UnsafeMutablePointer<SmkRegisteredRootSignatureSlice>
+) -> Int32
+
 @_silgen_name("smk_scan_result_file_lists")
 private nonisolated func smk_scan_result_file_lists(_ result: OpaquePointer?, _ outFileLists: UnsafeMutablePointer<SmkFileListSnapshotSlice>) -> Int32
 
@@ -1049,6 +1316,12 @@ private nonisolated func smk_scan_result_items(_ result: OpaquePointer?, _ outIt
 
 @_silgen_name("smk_scan_result_file_items")
 private nonisolated func smk_scan_result_file_items(_ result: OpaquePointer?, _ outItems: UnsafeMutablePointer<SmkScriptItemSlice>) -> Int32
+
+@_silgen_name("smk_scan_result_candidate_records")
+private nonisolated func smk_scan_result_candidate_records(
+    _ result: OpaquePointer?,
+    _ outRecords: UnsafeMutablePointer<SmkCandidateRecordSlice>
+) -> Int32
 
 @_silgen_name("smk_scan_result_update_info")
 private nonisolated func smk_scan_result_update_info(_ result: OpaquePointer?, _ outInfo: UnsafeMutablePointer<SmkUpdateCheckInfo>) -> Int32
@@ -1243,6 +1516,10 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
     private var cancellationEngine: ScriptMetaKitFFIEngine?
     private var watchNotificationSink: ScriptMetaKitWatchNotificationSink?
 
+    deinit {
+        shutdown()
+    }
+
     private func ensureEngineLocked() throws -> ScriptMetaKitFFIEngine {
         if let engine {
             return engine
@@ -1260,6 +1537,19 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
         let engine = cancellationEngine
         cancellationLock.unlock()
         engine?.cancelCurrentOperation()
+    }
+
+    public func shutdown() {
+        lock.lock()
+        let engineToRelease = engine
+        engineToRelease?.stopWatching()
+        watchNotificationSink = nil
+        engine = nil
+        lock.unlock()
+
+        cancellationLock.lock()
+        cancellationEngine = nil
+        cancellationLock.unlock()
     }
 
     public func scan(
@@ -1286,6 +1576,22 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
         defer { lock.unlock() }
         let engine = try ensureEngineLocked()
         try engine.setRoots(roots)
+        try restartWatcherIfNeeded()
+    }
+
+    public func replaceRootGroup(_ roots: [ScriptMetaKitRoot], groupID: String) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        let engine = try ensureEngineLocked()
+        try engine.replaceRootGroup(roots, groupID: groupID)
+        try restartWatcherIfNeeded()
+    }
+
+    public func insertRootsIntoGroup(_ roots: [ScriptMetaKitRoot], groupID: String) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        let engine = try ensureEngineLocked()
+        try engine.insertRootsIntoGroup(roots, groupID: groupID)
         try restartWatcherIfNeeded()
     }
 
@@ -1316,6 +1622,15 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return try ensureEngineLocked().scanRoots(rootIDs: rootIDs, mode: mode, checkUpdates: checkUpdates, onProgress: onProgress)
+    }
+
+    public func cachedRoots(
+        rootIDs: [String],
+        mode: ScriptMetaScanMode
+    ) throws -> ScriptMetaScanResult {
+        lock.lock()
+        defer { lock.unlock() }
+        return try ensureEngineLocked().cachedRoots(rootIDs: rootIDs, mode: mode)
     }
 
     public func startWatching(onChange: @escaping @Sendable () -> Void) throws {
@@ -1381,10 +1696,29 @@ private nonisolated final class ScriptMetaKitFFIEngineBox: @unchecked Sendable {
         try ensureEngineLocked().setDecompileCompiledOSADuringScan(enabled)
     }
 
+    public func setNativeEventLatencyMillis(_ latencyMillis: UInt64) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        try ensureEngineLocked().setNativeEventLatencyMillis(latencyMillis)
+        try restartWatcherIfNeeded()
+    }
+
     public func setRootPreflightOptions(_ options: ScriptMetaRootPreflightOptions) throws {
         lock.lock()
         defer { lock.unlock() }
         try ensureEngineLocked().setRootPreflightOptions(options)
+    }
+
+    public func loadCache(from fileURL: URL) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        try ensureEngineLocked().loadCache(from: fileURL)
+    }
+
+    public func saveCache(to fileURL: URL, scope: ScriptMetaCacheScope) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        try ensureEngineLocked().saveCache(to: fileURL, scope: scope)
     }
 
     public func writeScriptMetadata(
@@ -1506,11 +1840,16 @@ private nonisolated final class SmkInputStringArena: @unchecked Sendable {
         guard let value, !value.isEmpty else {
             return SmkUtf8Slice()
         }
-        let bytes = Array(value.utf8)
-        let pointer = UnsafeMutablePointer<UInt8>.allocate(capacity: bytes.count)
-        pointer.initialize(from: bytes, count: bytes.count)
-        allocations.append((pointer, bytes.count))
-        return SmkUtf8Slice(ptr: UnsafePointer(pointer), len: bytes.count)
+        var mutableValue = value
+        return mutableValue.withUTF8 { buffer in
+            guard let baseAddress = buffer.baseAddress else {
+                return SmkUtf8Slice()
+            }
+            let pointer = UnsafeMutablePointer<UInt8>.allocate(capacity: buffer.count)
+            pointer.initialize(from: baseAddress, count: buffer.count)
+            allocations.append((pointer, buffer.count))
+            return SmkUtf8Slice(ptr: UnsafePointer(pointer), len: buffer.count)
+        }
     }
 
     deinit {
@@ -1579,40 +1918,27 @@ private nonisolated final class ScriptMetaKitFFIEngine: @unchecked Sendable {
         checkUpdates: Bool,
         onProgress: (@Sendable (UpdateCheckProgress) -> Void)? = nil
     ) throws -> ScriptMetaScanResult {
-        let pathBuffers = folderURLs.map { Array($0.standardizedFileURL.path.utf8) }
-        let allocatedPaths = pathBuffers.map { bytes -> UnsafeMutablePointer<UInt8>? in
-            guard !bytes.isEmpty else { return nil }
-            let pointer = UnsafeMutablePointer<UInt8>.allocate(capacity: bytes.count)
-            pointer.initialize(from: bytes, count: bytes.count)
-            return pointer
-        }
-        defer {
-            for (index, pointer) in allocatedPaths.enumerated() {
-                guard let pointer else { continue }
-                pointer.deinitialize(count: pathBuffers[index].count)
-                pointer.deallocate()
-            }
-        }
-        let pathSlices = zip(pathBuffers, allocatedPaths).map { bytes, pointer in
-            SmkUtf8Slice(ptr: pointer.map { UnsafePointer($0) }, len: bytes.count)
-        }
+        let inputArena = SmkInputStringArena()
+        let pathSlices = folderURLs.map { inputArena.slice($0.standardizedFileURL.path) }
         let progressSink = onProgress.map { ScriptMetaKitProgressSink(onProgress: $0) }
         let progressContext = progressSink.map { Unmanaged.passUnretained($0).toOpaque() }
         var result: OpaquePointer?
-        let status = withExtendedLifetime(progressSink) {
-            pathSlices.withUnsafeBufferPointer { buffer in
-                if progressSink != nil {
-                    smk_engine_scan_folders_with_progress(
-                        handle,
-                        buffer.baseAddress,
-                        buffer.count,
-                        checkUpdates ? 1 : 0,
-                        updateProgressCallback,
-                        progressContext,
-                        &result
-                    )
-                } else {
-                    smk_engine_scan_folders(handle, buffer.baseAddress, buffer.count, checkUpdates ? 1 : 0, &result)
+        let status = withExtendedLifetime(inputArena) {
+            withExtendedLifetime(progressSink) {
+                pathSlices.withUnsafeBufferPointer { buffer in
+                    if progressSink != nil {
+                        smk_engine_scan_folders_with_progress(
+                            handle,
+                            buffer.baseAddress,
+                            buffer.count,
+                            checkUpdates ? 1 : 0,
+                            updateProgressCallback,
+                            progressContext,
+                            &result
+                        )
+                    } else {
+                        smk_engine_scan_folders(handle, buffer.baseAddress, buffer.count, checkUpdates ? 1 : 0, &result)
+                    }
                 }
             }
         }
@@ -1627,7 +1953,58 @@ private nonisolated final class ScriptMetaKitFFIEngine: @unchecked Sendable {
 
     public func setRoots(_ roots: [ScriptMetaKitRoot]) throws {
         let arena = SmkInputStringArena()
-        let registrations = roots.map { root in
+        let registrations = rootRegistrations(from: roots, arena: arena)
+        let status = withExtendedLifetime(arena) {
+            registrations.withUnsafeBufferPointer { buffer in
+                smk_engine_set_roots(handle, buffer.baseAddress, buffer.count)
+            }
+        }
+        guard status == smkStatusOK else {
+            throw ScriptMetaKitError.operationFailed(status, lastErrorMessage())
+        }
+    }
+
+    public func replaceRootGroup(_ roots: [ScriptMetaKitRoot], groupID: String) throws {
+        let arena = SmkInputStringArena()
+        let registrations = rootRegistrations(from: roots, arena: arena)
+        let status = withExtendedLifetime(arena) {
+            registrations.withUnsafeBufferPointer { buffer in
+                smk_engine_replace_root_group(
+                    handle,
+                    arena.slice(groupID),
+                    buffer.baseAddress,
+                    buffer.count
+                )
+            }
+        }
+        guard status == smkStatusOK else {
+            throw ScriptMetaKitError.operationFailed(status, lastErrorMessage())
+        }
+    }
+
+    public func insertRootsIntoGroup(_ roots: [ScriptMetaKitRoot], groupID: String) throws {
+        let arena = SmkInputStringArena()
+        let registrations = rootRegistrations(from: roots, arena: arena)
+        let status = withExtendedLifetime(arena) {
+            registrations.withUnsafeBufferPointer { buffer in
+                smk_engine_insert_roots_into_group(
+                    handle,
+                    arena.slice(groupID),
+                    buffer.baseAddress,
+                    buffer.count
+                )
+            }
+        }
+        guard status == smkStatusOK else {
+            throw ScriptMetaKitError.operationFailed(status, lastErrorMessage())
+        }
+    }
+
+    private func rootRegistrations(
+        from roots: [ScriptMetaKitRoot],
+        arena: SmkInputStringArena
+    ) -> [SmkRootRegistration] {
+        roots.map { root in
             SmkRootRegistration(
                 rootID: arena.slice(root.rootID),
                 path: arena.slice(root.url.standardizedFileURL.path),
@@ -1638,14 +2015,6 @@ private nonisolated final class ScriptMetaKitFFIEngine: @unchecked Sendable {
                 refreshPolicy: root.refreshPolicy.rawValue,
                 priority: root.priority.rawValue
             )
-        }
-        let status = withExtendedLifetime(arena) {
-            registrations.withUnsafeBufferPointer { buffer in
-                smk_engine_set_roots(handle, buffer.baseAddress, buffer.count)
-            }
-        }
-        guard status == smkStatusOK else {
-            throw ScriptMetaKitError.operationFailed(status, lastErrorMessage())
         }
     }
 
@@ -1738,6 +2107,33 @@ private nonisolated final class ScriptMetaKitFFIEngine: @unchecked Sendable {
         return try makeResult(from: result)
     }
 
+    public func cachedRoots(
+        rootIDs: [String],
+        mode: ScriptMetaScanMode
+    ) throws -> ScriptMetaScanResult {
+        let arena = SmkInputStringArena()
+        let rootIDSlices = rootIDs.map { arena.slice($0) }
+        var result: OpaquePointer?
+        let status = withExtendedLifetime(arena) {
+            rootIDSlices.withUnsafeBufferPointer { buffer in
+                smk_engine_cached_roots(
+                    handle,
+                    buffer.baseAddress,
+                    buffer.count,
+                    mode.rawValue,
+                    &result
+                )
+            }
+        }
+        guard status == smkStatusOK, let result else {
+            throw ScriptMetaKitError.operationFailed(status, lastErrorMessage())
+        }
+        defer {
+            smk_scan_result_free(result)
+        }
+        return try makeResult(from: result)
+    }
+
     public func checkUpdate(
         item: ScriptMetaItem,
         onProgress: (@Sendable (UpdateCheckProgress) -> Void)? = nil
@@ -1790,6 +2186,13 @@ private nonisolated final class ScriptMetaKitFFIEngine: @unchecked Sendable {
         }
     }
 
+    public func setNativeEventLatencyMillis(_ latencyMillis: UInt64) throws {
+        let status = smk_engine_set_native_event_latency_millis(handle, latencyMillis)
+        guard status == smkStatusOK else {
+            throw ScriptMetaKitError.operationFailed(status, lastErrorMessage())
+        }
+    }
+
     public func setRootPreflightOptions(_ options: ScriptMetaRootPreflightOptions) throws {
         guard options.maxScannedItems >= 0,
               options.minScannedFileCountForLargeRoot >= 0,
@@ -1808,6 +2211,26 @@ private nonisolated final class ScriptMetaKitFFIEngine: @unchecked Sendable {
             options.minScriptRatioDenominator,
             options.minScannedItemsForTimeLimit
         )
+        guard status == smkStatusOK else {
+            throw ScriptMetaKitError.operationFailed(status, lastErrorMessage())
+        }
+    }
+
+    public func loadCache(from fileURL: URL) throws {
+        let arena = SmkInputStringArena()
+        let status = withExtendedLifetime(arena) {
+            smk_engine_load_cache_file(handle, arena.slice(fileURL.standardizedFileURL.path))
+        }
+        guard status == smkStatusOK else {
+            throw ScriptMetaKitError.operationFailed(status, lastErrorMessage())
+        }
+    }
+
+    public func saveCache(to fileURL: URL, scope: ScriptMetaCacheScope) throws {
+        let arena = SmkInputStringArena()
+        let status = withExtendedLifetime(arena) {
+            smk_engine_save_cache_file(handle, scope.rawValue, arena.slice(fileURL.standardizedFileURL.path))
+        }
         guard status == smkStatusOK else {
             throw ScriptMetaKitError.operationFailed(status, lastErrorMessage())
         }
@@ -2175,17 +2598,34 @@ private nonisolated func makeResult(from result: OpaquePointer) throws -> Script
     let operationInfo = try operationInfo(from: result)
     let fileIssues = try fileIssues(from: result)
     let now = UInt64(Date().timeIntervalSince1970 * 1000)
-    let cacheBuiltAt = updateCheckResult?.checkedAt ?? roots.compactMap(\.lastLoadedAt).max() ?? now
+    let catalogInfo = try catalogInfo(from: result)
+    let hasCatalog = catalogInfo.hasCatalog != 0
+    let sourceRevision: String
+    let schemaVersion: UInt32
+    let cacheBuiltAt: UInt64
+    let registeredRoots: [RegisteredRootSignature]
+    if hasCatalog {
+        sourceRevision = string(catalogInfo.sourceRevision)
+        schemaVersion = catalogInfo.candidateCacheSchemaVersion
+        cacheBuiltAt = catalogInfo.candidateCacheBuiltAt
+        registeredRoots = try registeredRootSignatures(from: result)
+    } else {
+        sourceRevision = UUID().uuidString
+        schemaVersion = 5
+        cacheBuiltAt = updateCheckResult?.checkedAt ?? roots.compactMap(\.lastLoadedAt).max() ?? now
+        registeredRoots = []
+    }
+    let candidateRecords = try candidateRecords(from: result)
     let catalog = ScriptMetaCatalogSnapshot(
-        sourceRevision: UUID().uuidString,
+        sourceRevision: sourceRevision,
         roots: roots,
         allItems: allItems,
         fileItems: fileItems,
         candidateCache: CandidateCache(
-            schemaVersion: 4,
+            schemaVersion: schemaVersion,
             builtAt: cacheBuiltAt,
-            registeredRoots: roots.map { RegisteredRootSignature(rootID: $0.rootID, path: $0.path) },
-            records: []
+            registeredRoots: registeredRoots,
+            records: candidateRecords
         ),
         updateCheckResult: updateCheckResult
     )
@@ -2202,33 +2642,80 @@ private nonisolated func makeResult(from result: OpaquePointer) throws -> Script
     )
 }
 
-private nonisolated func scriptItems(from ffiItems: UnsafeBufferPointer<SmkScriptItem>) -> [ScriptMetaItem] {
-    ffiItems.map { item in
-        ScriptMetaItem(
-            rootID: string(item.rootID),
-            filePath: string(item.filePath),
-            identityPath: string(item.identityPath),
-            runtimeKind: optionalString(item.runtimeKind),
-            shebang: optionalString(item.shebang),
-            scriptID: string(item.scriptID),
-            version: optionalString(item.version),
-            itemDescription: optionalString(item.description),
-            targetApp: optionalString(item.targetApp),
-            minTargetVersion: optionalString(item.minTargetVersion),
-            metaURL: optionalString(item.metaURL),
-            name: optionalString(item.name),
-            author: optionalString(item.author),
-            releaseDate: optionalString(item.releaseDate),
-            editPasswordSHA256: optionalString(item.editPasswordSHA256),
-            hasScriptMeta: item.hasScriptMeta != 0,
-            hasScriptMetaEditPassword: item.hasScriptMetaEditPassword != 0,
-            isFileLocked: item.isFileLocked != 0,
-            isReadOnly: item.isReadOnly != 0,
-            canEditScriptMeta: item.canEditScriptMeta != 0,
-            canAppendScriptMeta: item.canAppendScriptMeta != 0,
-            scriptMetaEditState: string(item.scriptMetaEditState)
+private nonisolated func catalogInfo(from result: OpaquePointer) throws -> SmkCatalogInfo {
+    var info = SmkCatalogInfo()
+    try check(smk_scan_result_catalog_info(result, &info))
+    return info
+}
+
+private nonisolated func registeredRootSignatures(from result: OpaquePointer) throws -> [RegisteredRootSignature] {
+    var rootSlice = SmkRegisteredRootSignatureSlice()
+    try check(smk_scan_result_registered_root_signatures(result, &rootSlice))
+    return array(from: rootSlice).map { signature in
+        RegisteredRootSignature(
+            rootID: string(signature.rootID),
+            path: string(signature.path)
         )
     }
+}
+
+private nonisolated func candidateRecords(from result: OpaquePointer) throws -> [CandidateRecord] {
+    var recordSlice = SmkCandidateRecordSlice()
+    try check(smk_scan_result_candidate_records(result, &recordSlice))
+    return buffer(from: recordSlice).map { record in
+        CandidateRecord(
+            rootID: string(record.rootID),
+            rootPath: string(record.rootPath),
+            filePath: string(record.filePath),
+            identityPath: string(record.identityPath),
+            pathKind: optionalString(record.pathKind),
+            resolutionStatus: optionalString(record.resolutionStatus),
+            resolutionMessage: optionalString(record.resolutionMessage),
+            runtimeKind: optionalString(record.runtimeKind),
+            shebang: optionalString(record.shebang),
+            hasScriptMeta: record.hasScriptMeta != 0,
+            hasScriptMetaEditPassword: record.hasScriptMetaEditPassword != 0,
+            isFileLocked: record.isFileLocked != 0,
+            isReadOnly: record.isReadOnly != 0,
+            canEditScriptMeta: record.canEditScriptMeta != 0,
+            canAppendScriptMeta: record.canAppendScriptMeta != 0,
+            scriptMetaEditState: optionalString(record.scriptMetaEditState),
+            fileSize: record.hasFileSize != 0 ? record.fileSize : nil,
+            contentModifiedAt: record.hasContentModifiedAt != 0 ? record.contentModifiedAt : nil,
+            item: record.hasItem != 0 ? scriptItem(from: record.item) : nil
+        )
+    }
+}
+
+private nonisolated func scriptItems(from ffiItems: UnsafeBufferPointer<SmkScriptItem>) -> [ScriptMetaItem] {
+    ffiItems.map(scriptItem(from:))
+}
+
+private nonisolated func scriptItem(from item: SmkScriptItem) -> ScriptMetaItem {
+    ScriptMetaItem(
+        rootID: string(item.rootID),
+        filePath: string(item.filePath),
+        identityPath: string(item.identityPath),
+        runtimeKind: optionalString(item.runtimeKind),
+        shebang: optionalString(item.shebang),
+        scriptID: string(item.scriptID),
+        version: optionalString(item.version),
+        itemDescription: optionalString(item.description),
+        targetApp: optionalString(item.targetApp),
+        minTargetVersion: optionalString(item.minTargetVersion),
+        metaURL: optionalString(item.metaURL),
+        name: optionalString(item.name),
+        author: optionalString(item.author),
+        releaseDate: optionalString(item.releaseDate),
+        editPasswordSHA256: optionalString(item.editPasswordSHA256),
+        hasScriptMeta: item.hasScriptMeta != 0,
+        hasScriptMetaEditPassword: item.hasScriptMetaEditPassword != 0,
+        isFileLocked: item.isFileLocked != 0,
+        isReadOnly: item.isReadOnly != 0,
+        canEditScriptMeta: item.canEditScriptMeta != 0,
+        canAppendScriptMeta: item.canAppendScriptMeta != 0,
+        scriptMetaEditState: string(item.scriptMetaEditState)
+    )
 }
 
 private nonisolated func scanChangeSummary(from result: OpaquePointer) throws -> ScanChangeSummary? {
@@ -2555,6 +3042,89 @@ private nonisolated func scriptMetadataDraft(from draft: SmkScriptMetadataDraft)
     )
 }
 
+private nonisolated func validateScriptIDUniquenessViaFFI(
+    in items: [ScriptIdUniquenessItem]
+) throws -> ScriptIdUniquenessReport {
+    let arena = SmkInputStringArena()
+    let ffiItems = scriptItemsForUniqueness(from: items, arena: arena)
+    var result: OpaquePointer?
+    let status = withExtendedLifetime(arena) {
+        ffiItems.withUnsafeBufferPointer { buffer in
+            smk_validate_script_id_uniqueness(
+                buffer.baseAddress,
+                buffer.count,
+                &result
+            )
+        }
+    }
+    guard status == smkStatusOK, let result else {
+        throw ScriptMetaKitError.operationFailed(status, "SCRIPTMETAKit Script-ID uniqueness validation failed.")
+    }
+    defer {
+        smk_script_id_uniqueness_result_free(result)
+    }
+    return try scriptIDUniquenessReport(from: result)
+}
+
+private nonisolated func scriptItemsForUniqueness(
+    from items: [ScriptIdUniquenessItem],
+    arena: SmkInputStringArena
+) -> [SmkScriptIdUniquenessItem] {
+    items.map { item in
+        SmkScriptIdUniquenessItem(
+            itemID: arena.slice(item.itemID),
+            filePath: arena.slice(item.filePath),
+            scriptID: arena.slice(item.scriptID)
+        )
+    }
+}
+
+private nonisolated func scriptIDUniquenessReport(from result: OpaquePointer) throws -> ScriptIdUniquenessReport {
+    var report = SmkScriptIdUniquenessReport()
+    try check(smk_script_id_uniqueness_result_report(result, &report))
+
+    var duplicateSlice = SmkScriptIdDuplicateSlice()
+    try check(smk_script_id_uniqueness_result_duplicates(result, &duplicateSlice))
+
+    var itemIDSlice = SmkUtf8SliceSlice()
+    try check(smk_script_id_uniqueness_result_item_ids(result, &itemIDSlice))
+    let itemIDs = array(from: itemIDSlice).map(string)
+
+    var filePathSlice = SmkUtf8SliceSlice()
+    try check(smk_script_id_uniqueness_result_file_paths(result, &filePathSlice))
+    let filePaths = array(from: filePathSlice).map(string)
+
+    var duplicates: [ScriptIdDuplicate] = []
+    duplicates.reserveCapacity(report.duplicateCount)
+    for duplicate in array(from: duplicateSlice) {
+        guard let itemIDRange = safeRange(
+            start: duplicate.firstItemIDIndex,
+            count: duplicate.itemIDCount,
+            upperBound: itemIDs.count
+        ),
+            let filePathRange = safeRange(
+                start: duplicate.firstFilePathIndex,
+                count: duplicate.filePathCount,
+                upperBound: filePaths.count
+            ) else {
+            throw ScriptMetaKitError.operationFailed(4, "invalid Script-ID uniqueness result")
+        }
+        duplicates.append(
+            ScriptIdDuplicate(
+                scriptID: string(duplicate.scriptID),
+                itemIDs: Array(itemIDs[itemIDRange]),
+                filePaths: Array(filePaths[filePathRange])
+            )
+        )
+    }
+
+    return ScriptIdUniquenessReport(
+        totalItems: report.totalItems,
+        uniqueScriptIDs: report.uniqueScriptIDs,
+        duplicates: duplicates
+    )
+}
+
 private nonisolated func fileIdentity(from identity: SmkFileIdentity) -> FileIdentity {
     FileIdentity(
         stableID: string(identity.stableID),
@@ -2582,6 +3152,7 @@ private nonisolated func scriptMetaBackupRecord(
         id: string(record.id),
         createdAtMillis: record.createdAtMillis,
         backupFileName: string(record.backupFileName),
+        backupFilePath: string(record.backupFilePath),
         fileSize: record.fileSize,
         reason: ScriptMetaBackupReason(rawValue: string(record.reason)) ?? .unknown
     )
@@ -2630,6 +3201,7 @@ private nonisolated func fileEntries(
             canEditScriptMeta: entry.canEditScriptMeta != 0,
             canAppendScriptMeta: entry.canAppendScriptMeta != 0,
             scriptMetaEditState: string(entry.scriptMetaEditState),
+            scriptMetaItem: entry.hasScriptMetaItem != 0 ? scriptItem(from: entry.scriptMetaItem) : nil,
             children: fileEntries(
                 from: ffiEntries,
                 firstIndex: entry.firstChildIndex,
@@ -2666,6 +3238,10 @@ private nonisolated func buffer(from slice: SmkRootSnapshotSlice) -> UnsafeBuffe
     buffer(ptr: slice.ptr, len: slice.len)
 }
 
+private nonisolated func array(from slice: SmkRegisteredRootSignatureSlice) -> [SmkRegisteredRootSignature] {
+    copyArray(ptr: slice.ptr, len: slice.len)
+}
+
 private nonisolated func array(from slice: SmkFileListSnapshotSlice) -> [SmkFileListSnapshot] {
     copyArray(ptr: slice.ptr, len: slice.len)
 }
@@ -2687,6 +3263,14 @@ private nonisolated func array(from slice: SmkScriptItemSlice) -> [SmkScriptItem
 }
 
 private nonisolated func buffer(from slice: SmkScriptItemSlice) -> UnsafeBufferPointer<SmkScriptItem> {
+    buffer(ptr: slice.ptr, len: slice.len)
+}
+
+private nonisolated func array(from slice: SmkScriptIdDuplicateSlice) -> [SmkScriptIdDuplicate] {
+    copyArray(ptr: slice.ptr, len: slice.len)
+}
+
+private nonisolated func buffer(from slice: SmkCandidateRecordSlice) -> UnsafeBufferPointer<SmkCandidateRecord> {
     buffer(ptr: slice.ptr, len: slice.len)
 }
 

@@ -15,10 +15,11 @@ use uuid::Uuid;
 use crate::{
     ItemId,
     core::{
-        ScriptMetaItem, ScriptMetaKitError, ScriptMetaKitResult, ScriptRuntimeKind,
-        decode_script_text, normalize_metadata_url, normalize_version_string,
+        ScriptMetaKitError, ScriptMetaKitResult, ScriptRuntimeKind, decode_script_text,
+        decode_script_text_with_encoding, encode_script_text, normalize_metadata_url,
+        normalize_version_string,
     },
-    scanner::compiled_osa,
+    formats::{self, CommentSyntax, compiled_osa},
 };
 
 const SCRIPT_BEGIN: &str = "SCRIPTMETA-BEGIN";
@@ -49,6 +50,13 @@ pub struct ScriptIdDuplicate {
     pub script_id: String,
     pub item_ids: Vec<ItemId>,
     pub file_paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScriptIdUniquenessItem {
+    pub item_id: ItemId,
+    pub file_path: PathBuf,
+    pub script_id: String,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -84,17 +92,7 @@ pub enum ScriptMetaCommentStyle {
 impl ScriptMetaCommentStyle {
     #[must_use]
     pub fn for_path(path: &Path) -> Option<Self> {
-        let extension = path.extension()?.to_str()?.trim().trim_start_matches('.');
-        if ["js", "jsx", "jsxinc", "idjs", "jxa", "psjs"]
-            .iter()
-            .any(|candidate| extension.eq_ignore_ascii_case(candidate))
-        {
-            Some(Self::JavaScriptBlock)
-        } else if extension.eq_ignore_ascii_case("applescript") {
-            Some(Self::AppleScriptBlock)
-        } else {
-            None
-        }
+        scriptmeta_comment_style_from_syntax(formats::comment_syntax_for_path(path)?)
     }
 
     #[must_use]
@@ -148,6 +146,15 @@ impl ScriptMetaCommentStyle {
             Self::AppleScriptBlock => &["#"],
             Self::PlainText => &["#"],
         }
+    }
+}
+
+fn scriptmeta_comment_style_from_syntax(syntax: CommentSyntax) -> Option<ScriptMetaCommentStyle> {
+    match syntax {
+        CommentSyntax::JavaScriptBlock => Some(ScriptMetaCommentStyle::JavaScriptBlock),
+        CommentSyntax::AppleScriptBlock => Some(ScriptMetaCommentStyle::AppleScriptBlock),
+        CommentSyntax::PlainText => Some(ScriptMetaCommentStyle::PlainText),
+        CommentSyntax::None => None,
     }
 }
 
@@ -225,8 +232,18 @@ pub struct ScriptMetaBackupRecord {
     pub id: String,
     pub created_at_millis: u64,
     pub backup_file_name: String,
+    pub backup_file_path: PathBuf,
     pub file_size: u64,
     pub reason: ScriptMetaBackupReason,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ScriptMetaBackupIndexRecord {
+    id: String,
+    created_at_millis: u64,
+    backup_file_name: String,
+    file_size: u64,
+    reason: ScriptMetaBackupReason,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -247,7 +264,36 @@ struct ScriptMetaBackupIndex {
     original_path: PathBuf,
     file_name: String,
     first_generation_id: Option<String>,
-    generations: Vec<ScriptMetaBackupRecord>,
+    generations: Vec<ScriptMetaBackupIndexRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct LegacyScriptaBackupIndex {
+    #[serde(rename = "schemaVersion")]
+    schema_version: u32,
+    #[serde(rename = "fileID")]
+    _file_id: String,
+    #[serde(rename = "originalPath")]
+    _original_path: String,
+    #[serde(rename = "fileName")]
+    _file_name: String,
+    #[serde(rename = "firstGenerationID")]
+    first_generation_id: Option<String>,
+    generations: Vec<LegacyScriptaBackupRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct LegacyScriptaBackupRecord {
+    id: String,
+    #[serde(rename = "createdAt")]
+    _created_at: String,
+    #[serde(rename = "backupFileName")]
+    backup_file_name: String,
+    #[serde(rename = "fileSize")]
+    file_size: u64,
+    #[serde(rename = "sha256")]
+    _sha256: String,
+    reason: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -270,9 +316,12 @@ struct ScriptMetaInsertionPoint {
 }
 
 #[must_use]
-pub fn validate_script_id_uniqueness(items: &[ScriptMetaItem]) -> ScriptIdUniquenessReport {
-    let mut groups: BTreeMap<&str, Vec<&ScriptMetaItem>> = BTreeMap::new();
+pub fn validate_script_id_uniqueness(items: &[ScriptIdUniquenessItem]) -> ScriptIdUniquenessReport {
+    let mut groups: BTreeMap<&str, Vec<&ScriptIdUniquenessItem>> = BTreeMap::new();
     for item in items {
+        if item.script_id.is_empty() {
+            continue;
+        }
         groups
             .entry(item.script_id.as_str())
             .or_default()
@@ -284,7 +333,7 @@ pub fn validate_script_id_uniqueness(items: &[ScriptMetaItem]) -> ScriptIdUnique
         .filter(|(_, entries)| entries.len() > 1)
         .map(|(script_id, entries)| ScriptIdDuplicate {
             script_id: (*script_id).to_string(),
-            item_ids: entries.iter().map(|item| item.item_id()).collect(),
+            item_ids: entries.iter().map(|item| item.item_id.clone()).collect(),
             file_paths: entries.iter().map(|item| item.file_path.clone()).collect(),
         })
         .collect();
@@ -483,10 +532,13 @@ pub fn read_script_metadata_draft_from_file(
         let source = match compiled_osa::decompile_compiled_osa_source(path, None) {
             Ok(source) => source.source,
             Err(error) if compiled_osa_error_allows_text_fallback(error.kind) => {
-                fs::read_to_string(path).map_err(|error| ScriptMetaKitError::Io {
-                    path: path.to_path_buf(),
-                    message: error.to_string(),
-                })?
+                let bytes = read_script_bytes_file(path)?;
+                decode_script_text_with_encoding(&bytes)
+                    .ok_or_else(|| ScriptMetaKitError::Io {
+                        path: path.to_path_buf(),
+                        message: "script text encoding is not supported".to_string(),
+                    })?
+                    .text
             }
             Err(error) => {
                 return Err(ScriptMetaKitError::Io {
@@ -498,11 +550,15 @@ pub fn read_script_metadata_draft_from_file(
         return read_script_metadata_draft_from_text(&source, path);
     }
 
-    let source = fs::read_to_string(path).map_err(|error| ScriptMetaKitError::Io {
-        path: path.to_path_buf(),
-        message: error.to_string(),
-    })?;
-    read_script_metadata_draft_from_text(&source, path)
+    let bytes = read_script_bytes_file(path)?;
+    let decoded =
+        decode_script_text_with_encoding(&bytes).ok_or_else(|| ScriptMetaKitError::Io {
+            path: path.to_path_buf(),
+            message: "script text encoding is not supported".to_string(),
+        })?;
+    let mut result = read_script_metadata_draft_from_text(&decoded.text, path)?;
+    result.source_fingerprint = file_content_fingerprint(&bytes);
+    Ok(result)
 }
 
 pub fn append_script_metadata_to_file(
@@ -523,11 +579,13 @@ pub fn write_script_metadata_to_file(
         return write_script_metadata_to_compiled_osa_file(path, draft, mode, backup_options);
     }
 
-    let source = fs::read_to_string(path).map_err(|error| ScriptMetaKitError::Io {
-        path: path.to_path_buf(),
-        message: error.to_string(),
-    })?;
-    let updated = write_script_metadata_to_text(&source, path, draft, mode)?;
+    let bytes = read_script_bytes_file(path)?;
+    let decoded =
+        decode_script_text_with_encoding(&bytes).ok_or_else(|| ScriptMetaKitError::Io {
+            path: path.to_path_buf(),
+            message: "script text encoding is not supported".to_string(),
+        })?;
+    let updated = write_script_metadata_to_text(&decoded.text, path, draft, mode)?;
     let backup = match backup_options {
         Some(options) => Some(create_scriptmeta_backup(
             path,
@@ -537,7 +595,14 @@ pub fn write_script_metadata_to_file(
         None => None,
     };
 
-    if let Err(error) = write_text_file_atomic(path, &updated.text) {
+    let encoded = encode_script_text(&updated.text, decoded.encoding).ok_or_else(|| {
+        ScriptMetaKitError::Io {
+            path: path.to_path_buf(),
+            message: "updated script text cannot be encoded with the original encoding".to_string(),
+        }
+    })?;
+
+    if let Err(error) = write_bytes_file_atomic(path, &encoded) {
         if let (Some(options), Some(record)) = (backup_options, backup.as_ref()) {
             remove_scriptmeta_backup_if_possible(path, options, record);
         }
@@ -629,11 +694,13 @@ fn write_script_metadata_to_text_file(
     mode: ScriptMetaWriteMode,
     backup_options: Option<&ScriptMetaBackupOptions>,
 ) -> ScriptMetaKitResult<ScriptMetadataFileWriteResult> {
-    let source = fs::read_to_string(path).map_err(|error| ScriptMetaKitError::Io {
-        path: path.to_path_buf(),
-        message: error.to_string(),
-    })?;
-    let updated = write_script_metadata_to_text(&source, path, draft, mode)?;
+    let bytes = read_script_bytes_file(path)?;
+    let decoded =
+        decode_script_text_with_encoding(&bytes).ok_or_else(|| ScriptMetaKitError::Io {
+            path: path.to_path_buf(),
+            message: "script text encoding is not supported".to_string(),
+        })?;
+    let updated = write_script_metadata_to_text(&decoded.text, path, draft, mode)?;
     let backup = match backup_options {
         Some(options) => Some(create_scriptmeta_backup(
             path,
@@ -643,7 +710,14 @@ fn write_script_metadata_to_text_file(
         None => None,
     };
 
-    if let Err(error) = write_text_file_atomic(path, &updated.text) {
+    let encoded = encode_script_text(&updated.text, decoded.encoding).ok_or_else(|| {
+        ScriptMetaKitError::Io {
+            path: path.to_path_buf(),
+            message: "updated script text cannot be encoded with the original encoding".to_string(),
+        }
+    })?;
+
+    if let Err(error) = write_bytes_file_atomic(path, &encoded) {
         if let (Some(options), Some(record)) = (backup_options, backup.as_ref()) {
             remove_scriptmeta_backup_if_possible(path, options, record);
         }
@@ -754,7 +828,7 @@ pub fn create_scriptmeta_backup(
         path: path.to_path_buf(),
         message: error.to_string(),
     })?;
-    let record = ScriptMetaBackupRecord {
+    let record = ScriptMetaBackupIndexRecord {
         id: generation_id,
         created_at_millis: now_millis(),
         backup_file_name,
@@ -771,7 +845,7 @@ pub fn create_scriptmeta_backup(
         return Err(error);
     }
 
-    Ok(record)
+    Ok(scriptmeta_backup_record_from_index(&record, backup_path))
 }
 
 pub fn scriptmeta_backup_generations(
@@ -853,7 +927,12 @@ pub fn restore_scriptmeta_backup(
         path: path.to_path_buf(),
         message: error.to_string(),
     })?;
-    clear_scriptmeta_backups_after(path, options, generation_id)?;
+    clear_scriptmeta_backups_after_preserving(
+        path,
+        options,
+        generation_id,
+        Some(&before_restore.id),
+    )?;
     Ok(before_restore)
 }
 
@@ -1398,18 +1477,40 @@ fn load_backup_index(
         path: index_path.clone(),
         message: error.to_string(),
     })?;
-    let mut index: ScriptMetaBackupIndex = serde_json::from_slice(&data)
-        .map_err(|error| ScriptMetaKitError::Cache(error.to_string()))?;
-    if index.schema_version != BACKUP_SCHEMA_VERSION {
-        return Err(ScriptMetaKitError::Cache(format!(
-            "unsupported backup schema {}",
-            index.schema_version
-        )));
+    match serde_json::from_slice::<ScriptMetaBackupIndex>(&data) {
+        Ok(mut index) => {
+            if index.schema_version != BACKUP_SCHEMA_VERSION {
+                return Err(ScriptMetaKitError::Cache(format!(
+                    "unsupported backup schema {}",
+                    index.schema_version
+                )));
+            }
+            index.file_id = file_id;
+            index.original_path = original_path;
+            index.file_name = file_name;
+            Ok(index)
+        }
+        Err(index_error) => {
+            if let Ok(legacy_index) = serde_json::from_slice::<LegacyScriptaBackupIndex>(&data) {
+                return legacy_scripta_backup_index(
+                    legacy_index,
+                    path,
+                    options,
+                    file_id,
+                    original_path,
+                    file_name,
+                );
+            }
+            Ok(fallback_backup_index_from_generations(
+                path,
+                options,
+                file_id,
+                original_path,
+                file_name,
+                Some(index_error.to_string()),
+            ))
+        }
     }
-    index.file_id = file_id;
-    index.original_path = original_path;
-    index.file_name = file_name;
-    Ok(index)
 }
 
 fn write_backup_index(index: &ScriptMetaBackupIndex, index_path: &Path) -> ScriptMetaKitResult<()> {
@@ -1421,10 +1522,125 @@ fn write_backup_index(index: &ScriptMetaBackupIndex, index_path: &Path) -> Scrip
     })
 }
 
-fn clear_scriptmeta_backups_after(
+fn legacy_scripta_backup_index(
+    legacy_index: LegacyScriptaBackupIndex,
+    path: &Path,
+    options: &ScriptMetaBackupOptions,
+    file_id: String,
+    original_path: PathBuf,
+    file_name: String,
+) -> ScriptMetaKitResult<ScriptMetaBackupIndex> {
+    if legacy_index.schema_version != BACKUP_SCHEMA_VERSION {
+        return Err(ScriptMetaKitError::Cache(format!(
+            "unsupported legacy backup schema {}",
+            legacy_index.schema_version
+        )));
+    }
+
+    let backup_directory = backup_generations_directory(path, options);
+    let generations = legacy_index
+        .generations
+        .into_iter()
+        .filter_map(|record| {
+            let backup_path = backup_directory.join(&record.backup_file_name);
+            backup_path.exists().then(|| ScriptMetaBackupIndexRecord {
+                id: record.id,
+                created_at_millis: file_modified_millis(&backup_path).unwrap_or(0),
+                backup_file_name: record.backup_file_name,
+                file_size: record.file_size,
+                reason: legacy_scripta_backup_reason(&record.reason),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let first_generation_id = legacy_index
+        .first_generation_id
+        .filter(|id| generations.iter().any(|record| &record.id == id))
+        .or_else(|| generations.first().map(|record| record.id.clone()));
+
+    Ok(ScriptMetaBackupIndex {
+        schema_version: BACKUP_SCHEMA_VERSION,
+        file_id,
+        original_path,
+        file_name,
+        first_generation_id,
+        generations,
+    })
+}
+
+fn fallback_backup_index_from_generations(
+    path: &Path,
+    options: &ScriptMetaBackupOptions,
+    file_id: String,
+    original_path: PathBuf,
+    file_name: String,
+    _decode_error: Option<String>,
+) -> ScriptMetaBackupIndex {
+    let backup_directory = backup_generations_directory(path, options);
+    let mut generation_paths = fs::read_dir(&backup_directory)
+        .ok()
+        .into_iter()
+        .flat_map(|entries| entries.filter_map(Result::ok))
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
+    generation_paths.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+
+    let generations = generation_paths
+        .into_iter()
+        .filter_map(|generation_path| {
+            let metadata = fs::metadata(&generation_path).ok()?;
+            let backup_file_name = generation_path.file_name()?.to_string_lossy().into_owned();
+            Some(ScriptMetaBackupIndexRecord {
+                id: generation_path
+                    .file_stem()
+                    .map(|stem| stem.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| backup_file_name.clone()),
+                created_at_millis: file_modified_millis(&generation_path).unwrap_or(0),
+                backup_file_name,
+                file_size: metadata.len(),
+                reason: ScriptMetaBackupReason::BeforeSave,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    ScriptMetaBackupIndex {
+        schema_version: BACKUP_SCHEMA_VERSION,
+        file_id,
+        original_path,
+        file_name,
+        first_generation_id: generations.first().map(|record| record.id.clone()),
+        generations,
+    }
+}
+
+fn legacy_scripta_backup_reason(reason: &str) -> ScriptMetaBackupReason {
+    match reason {
+        "beforeRestore" => ScriptMetaBackupReason::BeforeRestore,
+        "resetInitial" => ScriptMetaBackupReason::ResetInitial,
+        _ => ScriptMetaBackupReason::BeforeSave,
+    }
+}
+
+fn scriptmeta_backup_record_from_index(
+    record: &ScriptMetaBackupIndexRecord,
+    backup_file_path: PathBuf,
+) -> ScriptMetaBackupRecord {
+    ScriptMetaBackupRecord {
+        id: record.id.clone(),
+        created_at_millis: record.created_at_millis,
+        backup_file_name: record.backup_file_name.clone(),
+        backup_file_path,
+        file_size: record.file_size,
+        reason: record.reason,
+    }
+}
+
+fn clear_scriptmeta_backups_after_preserving(
     path: &Path,
     options: &ScriptMetaBackupOptions,
     generation_id: &str,
+    preserved_generation_id: Option<&str>,
 ) -> ScriptMetaKitResult<()> {
     let mut index = load_backup_index(path, options)?;
     let Some(selected_index) = index
@@ -1440,10 +1656,19 @@ fn clear_scriptmeta_backups_after(
     if removed_records.is_empty() {
         return Ok(());
     }
-    write_backup_index(&index, &backup_index_path(path, options))?;
     let backup_directory = backup_generations_directory(path, options);
+    let mut removed_paths = Vec::new();
+    let mut preserved_records = Vec::new();
     for record in removed_records {
-        let backup_path = backup_directory.join(record.backup_file_name);
+        if preserved_generation_id.is_some_and(|id| id == record.id) {
+            preserved_records.push(record);
+        } else {
+            removed_paths.push(backup_directory.join(record.backup_file_name));
+        }
+    }
+    index.generations.extend(preserved_records);
+    write_backup_index(&index, &backup_index_path(path, options))?;
+    for backup_path in removed_paths {
         if backup_path.exists() {
             let _ = fs::remove_file(backup_path);
         }
@@ -1456,9 +1681,8 @@ fn remove_scriptmeta_backup_if_possible(
     options: &ScriptMetaBackupOptions,
     record: &ScriptMetaBackupRecord,
 ) {
-    let backup_path = backup_generations_directory(path, options).join(&record.backup_file_name);
-    if backup_path.exists() {
-        let _ = fs::remove_file(backup_path);
+    if record.backup_file_path.exists() {
+        let _ = fs::remove_file(&record.backup_file_path);
     }
     let Ok(mut index) = load_backup_index(path, options) else {
         return;
@@ -1530,8 +1754,11 @@ fn file_state_fingerprint(metadata: &fs::Metadata) -> String {
     format!("size:{}:modified:{modified}", metadata.len())
 }
 
-fn write_text_file_atomic(path: &Path, text: &str) -> std::io::Result<()> {
-    write_bytes_file_atomic(path, text.as_bytes())
+fn read_script_bytes_file(path: &Path) -> ScriptMetaKitResult<Vec<u8>> {
+    fs::read(path).map_err(|error| ScriptMetaKitError::Io {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })
 }
 
 fn compiled_osa_temp_path(path: &Path) -> PathBuf {
@@ -1555,12 +1782,41 @@ fn write_bytes_file_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             .unwrap_or_default(),
         Uuid::new_v4()
     ));
+    let mut temp_guard = TemporaryEditFile::new(temp_path.clone());
     {
         let mut file = fs::File::create(&temp_path)?;
         file.write_all(bytes)?;
         file.sync_all()?;
     }
-    replace_file(&temp_path, path)
+    replace_file(&temp_path, path)?;
+    temp_guard.disarm();
+    Ok(())
+}
+
+struct TemporaryEditFile {
+    path: PathBuf,
+    cleanup: bool,
+}
+
+impl TemporaryEditFile {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            cleanup: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.cleanup = false;
+    }
+}
+
+impl Drop for TemporaryEditFile {
+    fn drop(&mut self) {
+        if self.cleanup {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -1569,11 +1825,36 @@ fn replace_file(temp_path: &Path, target_path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
+#[allow(unsafe_code)]
 fn replace_file(temp_path: &Path, target_path: &Path) -> std::io::Result<()> {
-    if target_path.exists() {
-        fs::remove_file(target_path)?;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let temp_path_wide = temp_path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let target_path_wide = target_path
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    // SAFETY: the UTF-16 buffers are null-terminated and remain alive for the
+    // duration of the call. MoveFileExW does not retain the pointers.
+    let moved = unsafe {
+        MoveFileExW(
+            temp_path_wide.as_ptr(),
+            target_path_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    fs::rename(temp_path, target_path)
+    Ok(())
 }
 
 fn backup_timestamp_millis() -> u64 {
@@ -1739,24 +2020,22 @@ mod tests {
     use url::Url;
 
     use super::{
-        DistributionMetadataDraft, ScriptMetaBackupOptions, ScriptMetaCommentStyle,
-        ScriptMetaWriteMode, ScriptMetadataDraft, append_script_metadata_to_text,
-        clear_scriptmeta_backups, generate_edit_password_sha256, is_valid_edit_password_sha256,
+        DistributionMetadataDraft, ScriptIdUniquenessItem, ScriptMetaBackupOptions,
+        ScriptMetaBackupReason, ScriptMetaCommentStyle, ScriptMetaWriteMode, ScriptMetadataDraft,
+        append_script_metadata_to_text, backup_file_directory, clear_scriptmeta_backups,
+        generate_edit_password_sha256, is_valid_edit_password_sha256,
         render_distribution_metadata_block, render_script_metadata_for_style,
         restore_scriptmeta_backup, scriptmeta_backup_generations, validate_script_id_uniqueness,
         verify_edit_password_sha256, write_script_metadata_to_file, write_script_metadata_to_text,
     };
-    use crate::{
-        RootId,
-        core::{ScriptMetaItem, parse_distribution_metadata_for_script, parse_script_metadata},
-    };
+    use crate::core::{parse_distribution_metadata_for_script, parse_script_metadata};
 
     #[test]
     fn validates_script_id_uniqueness() {
         let items = vec![
-            item("root-a", "/tmp/a.jsx", "com.example.same"),
-            item("root-a", "/tmp/b.jsx", "com.example.same"),
-            item("root-a", "/tmp/c.jsx", "com.example.other"),
+            item("/tmp/a.jsx", "com.example.same"),
+            item("/tmp/b.jsx", "com.example.same"),
+            item("/tmp/c.jsx", "com.example.other"),
         ];
 
         let report = validate_script_id_uniqueness(&items);
@@ -1767,6 +2046,21 @@ mod tests {
         assert_eq!(report.duplicates.len(), 1);
         assert_eq!(report.duplicates[0].script_id, "com.example.same");
         assert_eq!(report.duplicates[0].item_ids, ["/tmp/a.jsx", "/tmp/b.jsx"]);
+    }
+
+    #[test]
+    fn validates_script_id_uniqueness_ignores_empty_ids() {
+        let items = vec![
+            item("/tmp/a.jsx", ""),
+            item("/tmp/b.jsx", ""),
+            item("/tmp/c.jsx", "com.example.one"),
+        ];
+
+        let report = validate_script_id_uniqueness(&items);
+
+        assert_eq!(report.total_items, 3);
+        assert_eq!(report.unique_script_ids, 1);
+        assert!(report.is_unique());
     }
 
     #[test]
@@ -1908,7 +2202,8 @@ mod tests {
             Some(&backup_options),
         )
         .expect("write metadata");
-        assert!(result.backup.is_some());
+        let backup_record = result.backup.as_ref().expect("backup");
+        assert!(backup_record.backup_file_path.exists());
 
         let generations =
             scriptmeta_backup_generations(&script_path, &backup_options).expect("generations");
@@ -1929,6 +2224,62 @@ mod tests {
         );
 
         clear_scriptmeta_backups(&script_path, &backup_options).expect("clear backups");
+    }
+
+    #[test]
+    fn reads_legacy_scripta_backup_index() {
+        let directory = tempdir().expect("tempdir");
+        let script_path = directory.path().join("Legacy.jsx");
+        fs::write(&script_path, "alert('current');\n").expect("write script");
+        let backup_options = ScriptMetaBackupOptions {
+            root_directory: directory.path().join("backups"),
+        };
+        let backup_directory = backup_file_directory(&script_path, &backup_options);
+        let generations_directory = backup_directory.join("generations");
+        fs::create_dir_all(&generations_directory).expect("backup dir");
+        let backup_file_name = "20260606-153000-abcdef123456.jsx";
+        let backup_path = generations_directory.join(backup_file_name);
+        fs::write(&backup_path, "alert('legacy');\n").expect("backup file");
+        let backup_size = fs::metadata(&backup_path).expect("backup metadata").len();
+        fs::write(
+            backup_directory.join("index.json"),
+            format!(
+                r#"{{
+  "schemaVersion" : 1,
+  "fileID" : "legacy",
+  "originalPath" : "{}",
+  "fileName" : "Legacy.jsx",
+  "firstGenerationID" : "20260606-153000-abcdef123456",
+  "generations" : [
+    {{
+      "id" : "20260606-153000-abcdef123456",
+      "createdAt" : "2026-06-06T06:30:00Z",
+      "backupFileName" : "{backup_file_name}",
+      "fileSize" : {backup_size},
+      "sha256" : "unused",
+      "reason" : "beforeRestore"
+    }}
+  ]
+}}"#,
+                script_path.display()
+            ),
+        )
+        .expect("legacy index");
+
+        let generations =
+            scriptmeta_backup_generations(&script_path, &backup_options).expect("generations");
+        let legacy_generation = generations
+            .iter()
+            .find(|generation| !generation.is_current_file)
+            .expect("legacy generation");
+
+        assert_eq!(legacy_generation.id, "20260606-153000-abcdef123456");
+        assert_eq!(legacy_generation.file_path, backup_path);
+        assert_eq!(legacy_generation.file_size, backup_size);
+        assert_eq!(
+            legacy_generation.reason,
+            ScriptMetaBackupReason::BeforeRestore
+        );
     }
 
     #[test]
@@ -1975,30 +2326,11 @@ mod tests {
         assert!(!verify_edit_password_sha256("secret", "invalid"));
     }
 
-    fn item(root_id: &str, file_path: &str, script_id: &str) -> ScriptMetaItem {
-        ScriptMetaItem {
-            root_id: RootId::from(root_id),
+    fn item(file_path: &str, script_id: &str) -> ScriptIdUniquenessItem {
+        ScriptIdUniquenessItem {
+            item_id: file_path.to_string(),
             file_path: file_path.into(),
-            identity_path: file_path.into(),
-            runtime_kind: None,
-            shebang: None,
             script_id: script_id.to_string(),
-            version: None,
-            description: None,
-            target_app: None,
-            min_target_version: None,
-            meta_url: None,
-            name: None,
-            author: None,
-            release_date: None,
-            edit_password_sha256: None,
-            has_scriptmeta: true,
-            has_scriptmeta_edit_password: false,
-            is_file_locked: false,
-            is_read_only: false,
-            can_edit_scriptmeta: true,
-            can_append_scriptmeta: false,
-            scriptmeta_edit_state: crate::core::ScriptMetaEditState::Editable,
         }
     }
 }

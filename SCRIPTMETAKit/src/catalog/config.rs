@@ -5,7 +5,8 @@ use crate::{
     scanner::{ExtensionPolicy, ScannerOptions},
     watcher::{
         DEFAULT_DEBOUNCE_DELAY_MILLIS, DEFAULT_MAX_DELIVERY_DELAY_MILLIS,
-        DEFAULT_MAX_PENDING_PATHS, MonitorRootStrategy, OverflowPolicy, WatchPolicy,
+        DEFAULT_MAX_PENDING_PATHS, DEFAULT_NATIVE_EVENT_LATENCY_MILLIS, MonitorRootStrategy,
+        OverflowPolicy, WatchPolicy,
     },
 };
 
@@ -30,6 +31,8 @@ pub struct WatcherOptions {
     pub watch_policy: WatchPolicy,
     pub debounce_delay_millis: u64,
     pub max_delivery_delay_millis: u64,
+    #[serde(default = "default_native_event_latency_millis")]
+    pub native_event_latency_millis: u64,
     pub max_pending_paths: usize,
     pub overflow_policy: OverflowPolicy,
     pub monitor_root_strategy: MonitorRootStrategy,
@@ -42,11 +45,16 @@ impl Default for WatcherOptions {
             watch_policy: WatchPolicy::VisibleOnly,
             debounce_delay_millis: DEFAULT_DEBOUNCE_DELAY_MILLIS,
             max_delivery_delay_millis: DEFAULT_MAX_DELIVERY_DELAY_MILLIS,
+            native_event_latency_millis: DEFAULT_NATIVE_EVENT_LATENCY_MILLIS,
             max_pending_paths: DEFAULT_MAX_PENDING_PATHS,
             overflow_policy: OverflowPolicy::MarkAffectedRootsDirty,
             monitor_root_strategy: MonitorRootStrategy::PlatformRecommended,
         }
     }
+}
+
+fn default_native_event_latency_millis() -> u64 {
+    DEFAULT_NATIVE_EVENT_LATENCY_MILLIS
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

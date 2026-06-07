@@ -7,9 +7,11 @@ cd "${ROOT}"
 FEATURES="${FEATURES:-blocking-http,native-watch}"
 PROFILE="${PROFILE:-release}"
 OUT_DIR="${ROOT}/Artifacts"
-HEADERS_DIR="${OUT_DIR}/ScriptMetaKitFFIHeaders"
-BUILD_DIR="${OUT_DIR}/build"
 XCFRAMEWORK_PATH="${OUT_DIR}/ScriptMetaKitFFI.xcframework"
+BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/scriptmetakit-xcframework.XXXXXX")"
+HEADERS_DIR="${BUILD_DIR}/ScriptMetaKitFFIHeaders"
+LEGACY_HEADERS_DIR="${OUT_DIR}/ScriptMetaKitFFIHeaders"
+trap 'rm -rf "${BUILD_DIR}"' EXIT
 
 if [[ "${PROFILE}" != "release" ]]; then
   echo "Unsupported PROFILE=${PROFILE}. Use PROFILE=release." >&2
@@ -24,7 +26,8 @@ if [[ -z "${CARGO_BIN}" ]]; then
   exit 1
 fi
 
-rm -rf "${XCFRAMEWORK_PATH}" "${HEADERS_DIR}" "${BUILD_DIR}"
+rm -rf "${XCFRAMEWORK_PATH}" "${LEGACY_HEADERS_DIR}"
+mkdir -p "${OUT_DIR}"
 mkdir -p "${HEADERS_DIR}" "${BUILD_DIR}"
 cp "${ROOT}/scriptmetakit_ffi/include/scriptmetakit_ffi.h" "${HEADERS_DIR}/"
 cat > "${HEADERS_DIR}/module.modulemap" <<'MODULEMAP'

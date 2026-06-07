@@ -18,12 +18,16 @@ use std::{
 #[cfg(target_os = "macos")]
 use sha2::{Digest, Sha256};
 
-use crate::core::{ScriptRuntimeKind, decode_script_text, parse_script_metadata};
+#[cfg(target_os = "macos")]
+use crate::core::decode_script_text;
+use crate::core::{ScriptRuntimeKind, parse_script_metadata};
 
 #[cfg(target_os = "macos")]
 const DEFAULT_DECOMPILE_TIMEOUT: Duration = Duration::from_millis(3_000);
 #[cfg(target_os = "macos")]
 const DEFAULT_COMPILE_TIMEOUT: Duration = Duration::from_millis(5_000);
+#[cfg(target_os = "macos")]
+const COMPILED_OSA_LANGUAGE_HINT_BYTES: usize = 64 * 1024;
 const SCRIPT_META_BEGIN: &[u8] = b"SCRIPTMETA-BEGIN";
 const SCRIPT_META_END: &[u8] = b"SCRIPTMETA-END";
 
@@ -42,11 +46,16 @@ pub(crate) struct CompiledOsaMetadataSnippet {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CompiledOsaErrorKind {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     SourceUnavailable,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     NotOsaScript,
     PermissionDenied,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Timeout,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     ToolUnavailable,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     ProcessFailed,
     Io,
     #[cfg_attr(target_os = "macos", allow(dead_code))]
@@ -70,7 +79,7 @@ impl CompiledOsaError {
 
 #[must_use]
 pub(crate) fn is_compiled_osa_path(path: &Path) -> bool {
-    extension_is(path, "scpt")
+    super::is_compiled_osa_path(path)
 }
 
 pub(crate) fn extract_compiled_osa_metadata_fast(
@@ -175,8 +184,7 @@ pub(crate) fn decompile_compiled_osa_source(
     path: &Path,
     timeout: Option<Duration>,
 ) -> Result<CompiledOsaSource, CompiledOsaError> {
-    let input_bytes = std::fs::read(path).map_err(|error| compiled_osa_io_error(path, error))?;
-    let language_hint = language_hint_from_compiled_bytes(&input_bytes);
+    let language_hint = read_compiled_osa_language_hint(path)?;
     let output = run_command_with_timeout(
         CommandSpec {
             program: "osadecompile",
@@ -197,6 +205,19 @@ pub(crate) fn decompile_compiled_osa_source(
         language_hint,
         source_fingerprint,
     })
+}
+
+#[cfg(target_os = "macos")]
+fn read_compiled_osa_language_hint(
+    path: &Path,
+) -> Result<Option<ScriptRuntimeKind>, CompiledOsaError> {
+    let mut file = File::open(path).map_err(|error| compiled_osa_io_error(path, error))?;
+    let mut buffer = Vec::with_capacity(COMPILED_OSA_LANGUAGE_HINT_BYTES);
+    Read::by_ref(&mut file)
+        .take(COMPILED_OSA_LANGUAGE_HINT_BYTES as u64)
+        .read_to_end(&mut buffer)
+        .map_err(|error| compiled_osa_io_error(path, error))?;
+    Ok(language_hint_from_compiled_bytes(&buffer))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -425,13 +446,6 @@ where
 #[cfg(target_os = "macos")]
 fn join_reader(handle: thread::JoinHandle<Vec<u8>>) -> Option<Vec<u8>> {
     handle.join().ok()
-}
-
-fn extension_is(path: &Path, expected: &str) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .map(|extension| extension.trim().trim_start_matches('.'))
-        .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
 }
 
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {

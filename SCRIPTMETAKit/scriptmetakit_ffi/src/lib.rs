@@ -1,6 +1,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet},
     ffi::c_void,
     panic::{AssertUnwindSafe, catch_unwind},
@@ -9,27 +10,33 @@ use std::{
     sync::Arc,
 };
 
+use scriptmetakit::scanner::CandidateRecord;
 use scriptmetakit::{
-    CachePolicy, DistributionMetadataDraft as KitDistributionMetadataDraft, DistributionResolution,
+    CachePolicy, CacheScope, CommentSyntax,
+    DistributionMetadataDraft as KitDistributionMetadataDraft, DistributionResolution,
     FileEntryChange, FileEntryChangeKind, FileIdentity, FileIssue, FileListSnapshot,
     FileSystemEntry, IgnoredWatchPath, OperationSummary, RefreshPolicy, RootChangeBatch, RootId,
     RootPriority, RootPurpose, RootRegistration, RootSnapshot, RootStatus, ScanChangeSummary,
-    ScanMode, ScanRequest, ScanResult, ScriptMetaBackupGeneration as KitScriptMetaBackupGeneration,
-    ScriptMetaBackupOptions, ScriptMetaBackupReason,
-    ScriptMetaBackupRecord as KitScriptMetaBackupRecord, ScriptMetaEditState, ScriptMetaItem,
-    ScriptMetaKitConfig, ScriptMetaKitEngine, ScriptMetaWriteMode, ScriptMetaWriteOperation,
+    ScanMode, ScanRequest, ScanResult, ScriptFileInspection, ScriptIdUniquenessItem,
+    ScriptMetaBackupGeneration as KitScriptMetaBackupGeneration, ScriptMetaBackupOptions,
+    ScriptMetaBackupReason, ScriptMetaBackupRecord as KitScriptMetaBackupRecord,
+    ScriptMetaCatalogSnapshot, ScriptMetaEditState, ScriptMetaItem, ScriptMetaKitConfig,
+    ScriptMetaKitEngine, ScriptMetaWriteMode, ScriptMetaWriteOperation,
     ScriptMetadataDraft as KitScriptMetadataDraft,
     ScriptMetadataEditPreviewResult as KitScriptMetadataEditPreviewResult,
     ScriptMetadataEditReadResult as KitScriptMetadataEditReadResult,
     ScriptMetadataFileWriteResult as KitScriptMetadataFileWriteResult, ScriptRuntimeKind,
     UpdateCheckProgress, UpdateCheckProgressPhase, UpdateCheckResult, UpdateFailure, UpdateStatus,
     WatchIgnoreReason, WatchPathEvent, WatchPathEventKind, WatchPolicy, WatchRenameCandidate,
-    WatchRenameConfidence, WatchRescanReason, WatchRescanTarget, clear_scriptmeta_backups,
-    create_scriptmeta_backup, generate_edit_password_sha256, is_valid_edit_password_sha256,
-    normalize_metadata_url, normalize_version_string, read_script_metadata_draft_from_file,
+    WatchRenameConfidence, WatchRescanReason, WatchRescanTarget, can_read_directory_contents,
+    clear_scriptmeta_backups, create_scriptmeta_backup, generate_edit_password_sha256,
+    inspect_script_file, is_valid_edit_password_sha256, load_cache_payload, normalize_metadata_url,
+    normalize_version_string, read_script_metadata_draft_from_file,
     read_script_metadata_edit_preview_from_file, render_distribution_metadata_block,
     reset_scriptmeta_backups_with_current_as_initial, restore_scriptmeta_backup,
-    scriptmeta_backup_generations, verify_edit_password_sha256, write_script_metadata_to_file,
+    save_cache_payload, script_path_may_affect_metadata, scriptmeta_backup_generations,
+    supported_script_extensions_text, validate_script_id_uniqueness, verify_edit_password_sha256,
+    write_script_metadata_to_file,
 };
 use url::Url;
 
@@ -100,6 +107,22 @@ pub struct SmkRootRegistration {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct SmkRegisteredRootSignature {
+    pub root_id: SmkUtf8Slice,
+    pub path: SmkUtf8Slice,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkCatalogInfo {
+    pub has_catalog: u8,
+    pub source_revision: SmkUtf8Slice,
+    pub candidate_cache_schema_version: u32,
+    pub candidate_cache_built_at: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct SmkFileIdentity {
     pub stable_id: SmkUtf8Slice,
     pub volume_id: SmkUtf8Slice,
@@ -108,6 +131,21 @@ pub struct SmkFileIdentity {
     pub file_size: u64,
     pub has_content_modified_at: u8,
     pub content_modified_at: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkScriptFileInspection {
+    pub is_supported_script_path: u8,
+    pub runtime_kind: SmkUtf8Slice,
+    pub shebang: SmkUtf8Slice,
+    pub comment_syntax: SmkUtf8Slice,
+    pub supports_inline_scriptmeta_editing: u8,
+    pub is_file_locked: u8,
+    pub is_read_only: u8,
+    pub can_edit_scriptmeta: u8,
+    pub can_append_scriptmeta: u8,
+    pub scriptmeta_edit_state: SmkUtf8Slice,
 }
 
 #[repr(C)]
@@ -134,6 +172,8 @@ pub struct SmkFileEntry {
     pub can_edit_scriptmeta: u8,
     pub can_append_scriptmeta: u8,
     pub scriptmeta_edit_state: SmkUtf8Slice,
+    pub has_scriptmeta_item: u8,
+    pub scriptmeta_item: SmkScriptItem,
     pub first_child_index: usize,
     pub child_count: usize,
 }
@@ -172,6 +212,41 @@ pub struct SmkScriptItem {
     pub can_edit_scriptmeta: u8,
     pub can_append_scriptmeta: u8,
     pub scriptmeta_edit_state: SmkUtf8Slice,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkScriptIdUniquenessItem {
+    pub item_id: SmkUtf8Slice,
+    pub file_path: SmkUtf8Slice,
+    pub script_id: SmkUtf8Slice,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkCandidateRecord {
+    pub root_id: SmkUtf8Slice,
+    pub root_path: SmkUtf8Slice,
+    pub file_path: SmkUtf8Slice,
+    pub identity_path: SmkUtf8Slice,
+    pub path_kind: SmkUtf8Slice,
+    pub resolution_status: SmkUtf8Slice,
+    pub resolution_message: SmkUtf8Slice,
+    pub runtime_kind: SmkUtf8Slice,
+    pub shebang: SmkUtf8Slice,
+    pub has_scriptmeta: u8,
+    pub has_scriptmeta_edit_password: u8,
+    pub is_file_locked: u8,
+    pub is_read_only: u8,
+    pub can_edit_scriptmeta: u8,
+    pub can_append_scriptmeta: u8,
+    pub scriptmeta_edit_state: SmkUtf8Slice,
+    pub has_file_size: u8,
+    pub file_size: u64,
+    pub has_content_modified_at: u8,
+    pub content_modified_at: u64,
+    pub has_item: u8,
+    pub item: SmkScriptItem,
 }
 
 #[repr(C)]
@@ -313,6 +388,13 @@ pub struct SmkRootSnapshotSlice {
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
+pub struct SmkRegisteredRootSignatureSlice {
+    pub ptr: *const SmkRegisteredRootSignature,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct SmkFileListSnapshotSlice {
     pub ptr: *const SmkFileListSnapshot,
     pub len: usize,
@@ -329,6 +411,38 @@ pub struct SmkFileEntrySlice {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SmkScriptItemSlice {
     pub ptr: *const SmkScriptItem,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkScriptIdUniquenessReport {
+    pub total_items: usize,
+    pub unique_script_ids: usize,
+    pub duplicate_count: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkScriptIdDuplicate {
+    pub script_id: SmkUtf8Slice,
+    pub first_item_id_index: usize,
+    pub item_id_count: usize,
+    pub first_file_path_index: usize,
+    pub file_path_count: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkScriptIdDuplicateSlice {
+    pub ptr: *const SmkScriptIdDuplicate,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SmkCandidateRecordSlice {
+    pub ptr: *const SmkCandidateRecord,
     pub len: usize,
 }
 
@@ -497,6 +611,7 @@ pub struct SmkScriptMetaBackupRecord {
     pub id: SmkUtf8Slice,
     pub created_at_millis: u64,
     pub backup_file_name: SmkUtf8Slice,
+    pub backup_file_path: SmkUtf8Slice,
     pub file_size: u64,
     pub reason: SmkUtf8Slice,
 }
@@ -567,12 +682,16 @@ pub struct SmkEngine {
 
 pub struct SmkScanResult {
     string_storage: Vec<u8>,
+    string_overflow: Vec<Box<[u8]>>,
     string_index: BTreeMap<String, SmkUtf8Slice>,
+    catalog_info: SmkCatalogInfo,
+    registered_root_signatures: Vec<SmkRegisteredRootSignature>,
     roots: Vec<SmkRootSnapshot>,
     file_lists: Vec<SmkFileListSnapshot>,
     file_entries: Vec<SmkFileEntry>,
     items: Vec<SmkScriptItem>,
     file_items: Vec<SmkScriptItem>,
+    candidate_records: Vec<SmkCandidateRecord>,
     update_info: SmkUpdateCheckInfo,
     update_statuses: Vec<SmkUpdateStatusEntry>,
     update_resolutions: Vec<SmkDistributionResolutionEntry>,
@@ -590,8 +709,18 @@ pub struct SmkScanResult {
     watch_rescan_targets: Vec<SmkWatchRescanTarget>,
 }
 
+pub struct SmkScriptIdUniquenessResult {
+    string_storage: Vec<u8>,
+    string_overflow: Vec<Box<[u8]>>,
+    report: SmkScriptIdUniquenessReport,
+    duplicates: Vec<SmkScriptIdDuplicate>,
+    item_ids: Vec<SmkUtf8Slice>,
+    file_paths: Vec<SmkUtf8Slice>,
+}
+
 pub struct SmkEditResult {
     string_storage: Vec<u8>,
+    string_overflow: Vec<Box<[u8]>>,
     text: SmkUtf8Slice,
     file_write_result: SmkScriptMetadataFileWriteResult,
     edit_read_result: SmkScriptMetadataEditReadResult,
@@ -603,6 +732,33 @@ pub struct SmkEditResult {
     backup_generations: Vec<SmkScriptMetaBackupGeneration>,
 }
 
+pub struct SmkScriptFileInspectionResult {
+    string_storage: Vec<u8>,
+    string_overflow: Vec<Box<[u8]>>,
+    inspection: SmkScriptFileInspection,
+}
+
+thread_local! {
+    static SCRIPT_FILE_INSPECTION_STORAGE: RefCell<Option<SmkScriptFileInspectionResult>> =
+        const { RefCell::new(None) };
+}
+
+impl SmkScriptFileInspectionResult {
+    fn new(value: ScriptFileInspection) -> Self {
+        let mut result = Self {
+            string_storage: Vec::with_capacity(value.shebang.as_ref().map_or(0, String::len)),
+            string_overflow: Vec::new(),
+            inspection: SmkScriptFileInspection::default(),
+        };
+        result.inspection = smk_script_file_inspection(
+            value,
+            &mut result.string_storage,
+            &mut result.string_overflow,
+        );
+        result
+    }
+}
+
 #[unsafe(no_mangle)]
 /// # Safety
 ///
@@ -611,6 +767,7 @@ pub struct SmkEditResult {
 pub unsafe extern "C" fn smk_engine_create_default(out_engine: *mut *mut SmkEngine) -> SmkStatus {
     ffi_guard(|| {
         let out_engine = out_mut(out_engine)?;
+        *out_engine = ptr::null_mut();
         let mut config = ScriptMetaKitConfig::default();
         config.watcher.watch_policy = WatchPolicy::AllRegistered;
         let engine = ScriptMetaKitEngine::new(config)
@@ -640,6 +797,81 @@ pub unsafe extern "C" fn smk_engine_free(engine: *mut SmkEngine) {
             drop(Box::from_raw(engine));
         }
     }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `out_extensions` must be a valid, writable pointer. The returned slice is a
+/// static newline-separated UTF-8 list and does not need to be freed.
+pub unsafe extern "C" fn smk_supported_script_extensions(
+    out_extensions: *mut SmkUtf8Slice,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let out_extensions = out_mut(out_extensions)?;
+        *out_extensions = static_slice(supported_script_extensions_text());
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `path` must be a valid UTF-8 path slice for the duration of the call.
+/// `out_inspection` must be a valid, writable pointer.
+pub unsafe extern "C" fn smk_inspect_script_file_path(
+    path: SmkUtf8Slice,
+    out_inspection: *mut SmkScriptFileInspection,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let path = path_from_slice(path)?;
+        let out_inspection = out_mut(out_inspection)?;
+        SCRIPT_FILE_INSPECTION_STORAGE.with(|storage| {
+            let mut storage = storage.borrow_mut();
+            *storage = Some(SmkScriptFileInspectionResult::new(inspect_script_file(
+                &path,
+            )));
+            *out_inspection = storage
+                .as_ref()
+                .map(|result| result.inspection)
+                .unwrap_or_default();
+            Ok(())
+        })
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `path` must be a valid UTF-8 path slice for the duration of the call.
+/// `out_may_affect` must be a valid, writable pointer.
+pub unsafe extern "C" fn smk_script_path_may_affect_metadata(
+    path: SmkUtf8Slice,
+    out_may_affect: *mut u8,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let path = path_from_slice(path)?;
+        let out_may_affect = out_mut(out_may_affect)?;
+        *out_may_affect = u8::from(script_path_may_affect_metadata(&path));
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `path` must be a valid UTF-8 path slice for the duration of the call.
+/// `out_can_read` must be a valid, writable pointer.
+pub unsafe extern "C" fn smk_can_read_directory_contents(
+    path: SmkUtf8Slice,
+    out_can_read: *mut u8,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let path = path_from_slice(path)?;
+        let out_can_read = out_mut(out_can_read)?;
+        *out_can_read = u8::from(can_read_directory_contents(&path));
+        Ok(())
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -700,6 +932,32 @@ pub unsafe extern "C" fn smk_engine_set_decompile_compiled_osa_during_scan(
             .config_mut()
             .scanner
             .decompile_compiled_osa_during_scan = enabled != 0;
+        Ok(())
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine` must be a live engine handle returned by
+/// `smk_engine_create_default`.
+pub unsafe extern "C" fn smk_engine_set_native_event_latency_millis(
+    engine: *mut SmkEngine,
+    latency_millis: u64,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        engine.clear_error();
+        engine
+            .engine
+            .config_mut()
+            .watcher
+            .native_event_latency_millis = latency_millis;
         Ok(())
     });
 
@@ -944,6 +1202,78 @@ pub unsafe extern "C" fn smk_engine_set_roots(
 #[unsafe(no_mangle)]
 /// # Safety
 ///
+/// `engine` must be a live engine handle. `group_id` must contain valid UTF-8.
+/// `roots_ptr` must point to `root_count` readable `SmkRootRegistration`
+/// values for the duration of the call unless `root_count` is zero. Existing
+/// roots in this group are replaced before the engine recomputes the merged
+/// registered root set.
+pub unsafe extern "C" fn smk_engine_replace_root_group(
+    engine: *mut SmkEngine,
+    group_id: SmkUtf8Slice,
+    roots_ptr: *const SmkRootRegistration,
+    root_count: usize,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        engine.clear_error();
+        let group_id = required_str_from_slice(group_id, "group_id")?.to_string();
+        let roots = root_registrations_from_raw(roots_ptr, root_count)?;
+
+        match engine.engine.replace_root_group(group_id, roots) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let message = error.to_string();
+                engine.set_error(&message);
+                Err((SmkStatus::EngineError, message))
+            }
+        }
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine` must be a live engine handle. `group_id` must contain valid UTF-8.
+/// `roots_ptr` must point to `root_count` readable `SmkRootRegistration`
+/// values for the duration of the call unless `root_count` is zero. Roots are
+/// inserted into this group, replacing entries with the same root_id in that
+/// group, and then the engine recomputes the merged registered root set.
+pub unsafe extern "C" fn smk_engine_insert_roots_into_group(
+    engine: *mut SmkEngine,
+    group_id: SmkUtf8Slice,
+    roots_ptr: *const SmkRootRegistration,
+    root_count: usize,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        engine.clear_error();
+        let group_id = required_str_from_slice(group_id, "group_id")?.to_string();
+        let roots = root_registrations_from_raw(roots_ptr, root_count)?;
+
+        match engine.engine.insert_roots_into_group(group_id, roots) {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let message = error.to_string();
+                engine.set_error(&message);
+                Err((SmkStatus::EngineError, message))
+            }
+        }
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
 /// `engine` must be a live engine handle. When `has_root_id` is non-zero,
 /// `root_id` must contain valid UTF-8 for the duration of this call. Passing
 /// `has_root_id=0` clears the visible root.
@@ -1058,6 +1388,44 @@ pub unsafe extern "C" fn smk_engine_scan_roots(
                 Err((SmkStatus::EngineError, message))
             }
         }
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine` must be a live engine handle with roots configured by
+/// `smk_engine_set_roots`. `root_ids_ptr` must point to `root_id_count`
+/// readable `SmkUtf8Slice` values for the duration of the call, unless
+/// `root_id_count` is zero. `scan_mode` uses 0=file_list_only,
+/// 1=metadata_only, 2=file_list_and_metadata. This returns only currently
+/// cached snapshots and never scans the file system. `out_result` must be
+/// writable. A non-null result must be released with `smk_scan_result_free`.
+pub unsafe extern "C" fn smk_engine_cached_roots(
+    engine: *mut SmkEngine,
+    root_ids_ptr: *const SmkUtf8Slice,
+    root_id_count: usize,
+    scan_mode: u32,
+    out_result: *mut *mut SmkScanResult,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        let out_result = out_mut(out_result)?;
+        *out_result = ptr::null_mut();
+        engine.clear_error();
+        let root_ids = root_ids_from_raw(root_ids_ptr, root_id_count)?;
+        let scan_mode = scan_mode_from_u32(scan_mode)?;
+        let result = engine.engine.cached_scan_result(ScanRequest {
+            root_ids,
+            mode: scan_mode,
+        });
+        *out_result = Box::into_raw(Box::new(SmkScanResult::from_scan_result(result, None)));
+        Ok(())
     });
 
     if status == SmkStatus::Panic {
@@ -1248,6 +1616,193 @@ pub unsafe extern "C" fn smk_engine_check_update_item_with_progress(
 #[unsafe(no_mangle)]
 /// # Safety
 ///
+/// `items_ptr` must point to `item_count` readable
+/// `SmkScriptIdUniquenessItem` values for the duration of the call, unless
+/// `item_count` is zero. `out_result` must be writable. A non-null result must
+/// be released with
+/// `smk_script_id_uniqueness_result_free`.
+pub unsafe extern "C" fn smk_validate_script_id_uniqueness(
+    items_ptr: *const SmkScriptIdUniquenessItem,
+    item_count: usize,
+    out_result: *mut *mut SmkScriptIdUniquenessResult,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let out_result = out_mut(out_result)?;
+        *out_result = ptr::null_mut();
+        let items = script_items_for_uniqueness_from_raw(items_ptr, item_count)?;
+        let report = validate_script_id_uniqueness(&items);
+        *out_result = Box::into_raw(Box::new(SmkScriptIdUniquenessResult::from_report(&report)));
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `result` must be a live result handle returned by
+/// `smk_validate_script_id_uniqueness`. `out_report` must be writable.
+pub unsafe extern "C" fn smk_script_id_uniqueness_result_report(
+    result: *const SmkScriptIdUniquenessResult,
+    out_report: *mut SmkScriptIdUniquenessReport,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = input_ref(result, "script id uniqueness result")?;
+        let out_report = out_mut(out_report)?;
+        *out_report = result.report;
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `result` must be a live result handle returned by
+/// `smk_validate_script_id_uniqueness`. `out_duplicates` must be writable.
+/// Returned pointers remain valid until the result is freed.
+pub unsafe extern "C" fn smk_script_id_uniqueness_result_duplicates(
+    result: *const SmkScriptIdUniquenessResult,
+    out_duplicates: *mut SmkScriptIdDuplicateSlice,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = input_ref(result, "script id uniqueness result")?;
+        let out_duplicates = out_mut(out_duplicates)?;
+        *out_duplicates = SmkScriptIdDuplicateSlice {
+            ptr: result.duplicates.as_ptr(),
+            len: result.duplicates.len(),
+        };
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `result` must be a live result handle returned by
+/// `smk_validate_script_id_uniqueness`. `out_item_ids` must be writable.
+/// Returned pointers remain valid until the result is freed.
+pub unsafe extern "C" fn smk_script_id_uniqueness_result_item_ids(
+    result: *const SmkScriptIdUniquenessResult,
+    out_item_ids: *mut SmkUtf8SliceSlice,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = input_ref(result, "script id uniqueness result")?;
+        let out_item_ids = out_mut(out_item_ids)?;
+        *out_item_ids = SmkUtf8SliceSlice {
+            ptr: result.item_ids.as_ptr(),
+            len: result.item_ids.len(),
+        };
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `result` must be a live result handle returned by
+/// `smk_validate_script_id_uniqueness`. `out_file_paths` must be writable.
+/// Returned pointers remain valid until the result is freed.
+pub unsafe extern "C" fn smk_script_id_uniqueness_result_file_paths(
+    result: *const SmkScriptIdUniquenessResult,
+    out_file_paths: *mut SmkUtf8SliceSlice,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = input_ref(result, "script id uniqueness result")?;
+        let out_file_paths = out_mut(out_file_paths)?;
+        *out_file_paths = SmkUtf8SliceSlice {
+            ptr: result.file_paths.as_ptr(),
+            len: result.file_paths.len(),
+        };
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `result` must be null or a handle returned by
+/// `smk_validate_script_id_uniqueness` that has not already been freed.
+pub unsafe extern "C" fn smk_script_id_uniqueness_result_free(
+    result: *mut SmkScriptIdUniquenessResult,
+) {
+    if !result.is_null() {
+        // SAFETY: the caller transfers ownership of a handle allocated by this library.
+        unsafe {
+            drop(Box::from_raw(result));
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine` must be a live engine handle. `cache_path` must contain a valid
+/// UTF-8 file path. Persistent cache must be enabled by the registered roots'
+/// cache policies.
+pub unsafe extern "C" fn smk_engine_load_cache_file(
+    engine: *mut SmkEngine,
+    cache_path: SmkUtf8Slice,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        engine.clear_error();
+        let cache_path = path_from_slice(cache_path)?;
+        let payload = load_cache_payload(&cache_path).map_err(|error| {
+            let message = error.to_string();
+            engine.set_error(&message);
+            (SmkStatus::EngineError, message)
+        })?;
+        engine.engine.load_cache(payload).map_err(|error| {
+            let message = error.to_string();
+            engine.set_error(&message);
+            (SmkStatus::EngineError, message)
+        })?;
+        Ok(())
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `engine` must be a live engine handle. `cache_path` must contain a valid
+/// UTF-8 file path. Parent directories are created by Kit when needed.
+pub unsafe extern "C" fn smk_engine_save_cache_file(
+    engine: *mut SmkEngine,
+    scope: u32,
+    cache_path: SmkUtf8Slice,
+) -> SmkStatus {
+    let status = ffi_guard(|| {
+        let engine = engine_mut(engine)?;
+        engine.clear_error();
+
+        let scope = cache_scope_from_u32(scope)?;
+        let cache_path = path_from_slice(cache_path)?;
+        let payload = engine.engine.export_cache(scope).map_err(|error| {
+            let message = error.to_string();
+            engine.set_error(&message);
+            (SmkStatus::EngineError, message)
+        })?;
+        save_cache_payload(&cache_path, &payload).map_err(|error| {
+            let message = error.to_string();
+            engine.set_error(&message);
+            (SmkStatus::EngineError, message)
+        })?;
+        Ok(())
+    });
+
+    if status == SmkStatus::Panic {
+        set_engine_error(engine, "panic crossed scriptmetakit_ffi boundary");
+    }
+    status
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
 /// `engine` must be a live engine handle. The engine must already have roots,
 /// normally by calling one of the scan functions first.
 pub unsafe extern "C" fn smk_engine_start_watching(engine: *mut SmkEngine) -> SmkStatus {
@@ -1375,6 +1930,44 @@ pub unsafe extern "C" fn smk_scan_result_roots(
 #[unsafe(no_mangle)]
 /// # Safety
 ///
+/// `result` must be a live scan result handle. `out_info` must be a valid,
+/// writable pointer.
+pub unsafe extern "C" fn smk_scan_result_catalog_info(
+    result: *const SmkScanResult,
+    out_info: *mut SmkCatalogInfo,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = scan_result_ref(result)?;
+        let out_info = out_mut(out_info)?;
+        *out_info = result.catalog_info;
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `result` must be a live scan result handle. `out_roots` must be a valid,
+/// writable pointer. The returned slice is borrowed from `result` and remains
+/// valid only until `result` is freed.
+pub unsafe extern "C" fn smk_scan_result_registered_root_signatures(
+    result: *const SmkScanResult,
+    out_roots: *mut SmkRegisteredRootSignatureSlice,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = scan_result_ref(result)?;
+        let out_roots = out_mut(out_roots)?;
+        *out_roots = SmkRegisteredRootSignatureSlice {
+            ptr: result.registered_root_signatures.as_ptr(),
+            len: result.registered_root_signatures.len(),
+        };
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
 /// `result` must be a live scan result handle. `out_file_lists` must be a
 /// valid, writable pointer. The returned slice is borrowed from `result` and
 /// remains valid only until `result` is freed.
@@ -1451,6 +2044,27 @@ pub unsafe extern "C" fn smk_scan_result_file_items(
         *out_items = SmkScriptItemSlice {
             ptr: result.file_items.as_ptr(),
             len: result.file_items.len(),
+        };
+        Ok(())
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// `result` must be a live scan result handle. `out_records` must be a valid,
+/// writable pointer. The returned record slice is borrowed from `result` and
+/// remains valid only until `result` is freed.
+pub unsafe extern "C" fn smk_scan_result_candidate_records(
+    result: *const SmkScanResult,
+    out_records: *mut SmkCandidateRecordSlice,
+) -> SmkStatus {
+    ffi_guard(|| {
+        let result = scan_result_ref(result)?;
+        let out_records = out_mut(out_records)?;
+        *out_records = SmkCandidateRecordSlice {
+            ptr: result.candidate_records.as_ptr(),
+            len: result.candidate_records.len(),
         };
         Ok(())
     })
@@ -1742,8 +2356,8 @@ pub unsafe extern "C" fn smk_scan_result_watch_rescan_targets(
 #[unsafe(no_mangle)]
 /// # Safety
 ///
-/// `result` must be null or a live handle returned by `smk_engine_scan_folder`
-/// or `smk_engine_scan_folders`. Each non-null handle must be freed at most once.
+/// `result` must be null or a live scan result handle returned by this crate.
+/// Each non-null handle must be freed at most once.
 pub unsafe extern "C" fn smk_scan_result_free(result: *mut SmkScanResult) {
     if !result.is_null() {
         // SAFETY: `result` must be a pointer returned by this crate.
@@ -2552,7 +3166,15 @@ impl SmkScanResult {
         let file_entry_capacity = total_file_entry_count(&scan_result);
         let mut result = Self {
             string_storage: Vec::with_capacity(string_capacity),
+            string_overflow: Vec::new(),
             string_index: BTreeMap::new(),
+            catalog_info: SmkCatalogInfo::default(),
+            registered_root_signatures: scan_result
+                .catalog_snapshot
+                .as_ref()
+                .map_or_else(Vec::new, |snapshot| {
+                    Vec::with_capacity(snapshot.candidate_cache.registered_roots.len())
+                }),
             roots: Vec::with_capacity(scan_result.roots.len()),
             file_lists: Vec::with_capacity(scan_result.file_list_snapshots.len()),
             file_entries: Vec::with_capacity(file_entry_capacity),
@@ -2567,6 +3189,12 @@ impl SmkScanResult {
                 .as_ref()
                 .map_or_else(Vec::new, |snapshot| {
                     Vec::with_capacity(snapshot.file_items.len())
+                }),
+            candidate_records: scan_result
+                .catalog_snapshot
+                .as_ref()
+                .map_or_else(Vec::new, |snapshot| {
+                    Vec::with_capacity(snapshot.candidate_cache.records.len())
                 }),
             update_info: SmkUpdateCheckInfo::default(),
             update_statuses: Vec::new(),
@@ -2604,6 +3232,7 @@ impl SmkScanResult {
         }
 
         if let Some(snapshot) = scan_result.catalog_snapshot.as_ref() {
+            result.push_catalog_info(snapshot);
             let mut all_item_indices = BTreeMap::new();
             for item in &snapshot.all_items {
                 let item_key = std::sync::Arc::as_ptr(item) as usize;
@@ -2618,6 +3247,9 @@ impl SmkScanResult {
                 } else {
                     result.push_file_script_item(item);
                 }
+            }
+            for record in &snapshot.candidate_cache.records {
+                result.push_candidate_record(record);
             }
         }
 
@@ -2639,12 +3271,16 @@ impl SmkScanResult {
     fn from_update_result(update_result: &UpdateCheckResult) -> Self {
         let mut result = Self {
             string_storage: Vec::with_capacity(update_result_string_bytes(update_result)),
+            string_overflow: Vec::new(),
             string_index: BTreeMap::new(),
+            catalog_info: SmkCatalogInfo::default(),
+            registered_root_signatures: Vec::new(),
             roots: Vec::new(),
             file_lists: Vec::new(),
             file_entries: Vec::new(),
             items: Vec::new(),
             file_items: Vec::new(),
+            candidate_records: Vec::new(),
             update_info: SmkUpdateCheckInfo::default(),
             update_statuses: Vec::new(),
             update_resolutions: Vec::new(),
@@ -2685,6 +3321,23 @@ impl SmkScanResult {
                 .push_string(root.error.as_ref().map(|error| error.message.as_str())),
         };
         self.roots.push(ffi_root);
+    }
+
+    fn push_catalog_info(&mut self, snapshot: &ScriptMetaCatalogSnapshot) {
+        let source_revision = snapshot.source_revision.to_string();
+        self.catalog_info = SmkCatalogInfo {
+            has_catalog: 1,
+            source_revision: self.push_string(Some(source_revision.as_str())),
+            candidate_cache_schema_version: snapshot.candidate_cache.schema_version,
+            candidate_cache_built_at: snapshot.candidate_cache.built_at,
+        };
+        for signature in &snapshot.candidate_cache.registered_roots {
+            let ffi_signature = SmkRegisteredRootSignature {
+                root_id: self.push_string(Some(signature.root_id.as_ref())),
+                path: self.push_path(&signature.path),
+            };
+            self.registered_root_signatures.push(ffi_signature);
+        }
     }
 
     fn push_operation_info(&mut self, operation: &OperationSummary) {
@@ -2739,6 +3392,11 @@ impl SmkScanResult {
     fn push_file_entries(&mut self, entries: &[FileSystemEntry]) -> usize {
         let first_entry_index = self.file_entries.len();
         for entry in entries {
+            let scriptmeta_item = entry
+                .scriptmeta_item
+                .as_ref()
+                .map(|item| self.script_item(item))
+                .unwrap_or_default();
             let ffi_entry = SmkFileEntry {
                 display_path: self.push_path(&entry.display_path),
                 resolved_path: self.push_path(&entry.resolved_path),
@@ -2767,6 +3425,8 @@ impl SmkScanResult {
                 can_edit_scriptmeta: bool_byte(entry.can_edit_scriptmeta),
                 can_append_scriptmeta: bool_byte(entry.can_append_scriptmeta),
                 scriptmeta_edit_state: static_slice(entry.scriptmeta_edit_state.as_str()),
+                has_scriptmeta_item: bool_byte(entry.scriptmeta_item.is_some()),
+                scriptmeta_item,
                 first_child_index: 0,
                 child_count: 0,
             };
@@ -2819,6 +3479,50 @@ impl SmkScanResult {
             can_edit_scriptmeta: bool_byte(item.can_edit_scriptmeta),
             can_append_scriptmeta: bool_byte(item.can_append_scriptmeta),
             scriptmeta_edit_state: static_slice(item.scriptmeta_edit_state.as_str()),
+        }
+    }
+
+    fn push_candidate_record(&mut self, record: &CandidateRecord) {
+        let ffi_record = self.candidate_record(record);
+        self.candidate_records.push(ffi_record);
+    }
+
+    fn candidate_record(&mut self, record: &CandidateRecord) -> SmkCandidateRecord {
+        let (has_file_size, file_size) = optional_u64(record.file_size);
+        let (has_content_modified_at, content_modified_at) =
+            optional_u64(record.content_modified_at);
+        let item = record
+            .item
+            .as_ref()
+            .map(|item| self.script_item(item))
+            .unwrap_or_default();
+        SmkCandidateRecord {
+            root_id: self.push_string(Some(record.root_id.as_ref())),
+            root_path: self.push_path(&record.root_path),
+            file_path: self.push_path(&record.file_path),
+            identity_path: self.push_path(&record.identity_path),
+            path_kind: static_slice(record.path_kind.as_str()),
+            resolution_status: static_slice(record.resolution_status.as_str()),
+            resolution_message: self.push_string(record.resolution_message.as_deref()),
+            runtime_kind: record
+                .runtime_kind
+                .map_or_else(SmkUtf8Slice::empty, |kind| {
+                    static_slice(script_runtime_kind(kind))
+                }),
+            shebang: self.push_string(record.shebang.as_deref()),
+            has_scriptmeta: bool_byte(record.has_scriptmeta),
+            has_scriptmeta_edit_password: bool_byte(record.has_scriptmeta_edit_password),
+            is_file_locked: bool_byte(record.is_file_locked),
+            is_read_only: bool_byte(record.is_read_only),
+            can_edit_scriptmeta: bool_byte(record.can_edit_scriptmeta),
+            can_append_scriptmeta: bool_byte(record.can_append_scriptmeta),
+            scriptmeta_edit_state: static_slice(record.scriptmeta_edit_state.as_str()),
+            has_file_size,
+            file_size,
+            has_content_modified_at,
+            content_modified_at,
+            has_item: bool_byte(record.item.is_some()),
+            item,
         }
     }
 
@@ -3055,16 +3759,7 @@ impl SmkScanResult {
         if let Some(slice) = self.string_index.get(value) {
             return *slice;
         }
-        debug_assert!(
-            self.string_storage.len().saturating_add(value.len()) <= self.string_storage.capacity()
-        );
-        assert!(
-            self.string_storage.len().saturating_add(value.len()) <= self.string_storage.capacity(),
-            "SCRIPTMETAKit FFI string storage capacity was underestimated"
-        );
-        let start = self.string_storage.len();
-        self.string_storage.extend_from_slice(value.as_bytes());
-        let slice = borrowed_slice(&self.string_storage[start..]);
+        let slice = push_stable_string(&mut self.string_storage, &mut self.string_overflow, value);
         self.string_index.insert(value.to_string(), slice);
         slice
     }
@@ -3079,10 +3774,71 @@ impl SmkScanResult {
     }
 }
 
+impl SmkScriptIdUniquenessResult {
+    fn from_report(report: &scriptmetakit::ScriptIdUniquenessReport) -> Self {
+        let string_capacity = report
+            .duplicates
+            .iter()
+            .map(|duplicate| {
+                duplicate.script_id.len()
+                    + duplicate.item_ids.iter().map(String::len).sum::<usize>()
+                    + duplicate
+                        .file_paths
+                        .iter()
+                        .map(|path| path.to_string_lossy().len())
+                        .sum::<usize>()
+            })
+            .sum();
+        let mut result = Self {
+            string_storage: Vec::with_capacity(string_capacity),
+            string_overflow: Vec::new(),
+            report: SmkScriptIdUniquenessReport {
+                total_items: report.total_items,
+                unique_script_ids: report.unique_script_ids,
+                duplicate_count: report.duplicates.len(),
+            },
+            duplicates: Vec::with_capacity(report.duplicates.len()),
+            item_ids: Vec::new(),
+            file_paths: Vec::new(),
+        };
+
+        for duplicate in &report.duplicates {
+            let first_item_id_index = result.item_ids.len();
+            for item_id in &duplicate.item_ids {
+                let item_id = result.push_string(item_id);
+                result.item_ids.push(item_id);
+            }
+
+            let first_file_path_index = result.file_paths.len();
+            for file_path in &duplicate.file_paths {
+                let file_path = file_path.to_string_lossy();
+                let file_path = result.push_string(file_path.as_ref());
+                result.file_paths.push(file_path);
+            }
+
+            let ffi_duplicate = SmkScriptIdDuplicate {
+                script_id: result.push_string(&duplicate.script_id),
+                first_item_id_index,
+                item_id_count: duplicate.item_ids.len(),
+                first_file_path_index,
+                file_path_count: duplicate.file_paths.len(),
+            };
+            result.duplicates.push(ffi_duplicate);
+        }
+
+        result
+    }
+
+    fn push_string(&mut self, value: &str) -> SmkUtf8Slice {
+        push_stable_string(&mut self.string_storage, &mut self.string_overflow, value)
+    }
+}
+
 impl SmkEditResult {
     fn empty(string_capacity: usize, generation_capacity: usize) -> Self {
         Self {
             string_storage: Vec::with_capacity(string_capacity),
+            string_overflow: Vec::new(),
             text: SmkUtf8Slice::empty(),
             file_write_result: SmkScriptMetadataFileWriteResult::default(),
             edit_read_result: SmkScriptMetadataEditReadResult::default(),
@@ -3225,6 +3981,7 @@ impl SmkEditResult {
             id: self.push_string(Some(value.id.as_str())),
             created_at_millis: value.created_at_millis,
             backup_file_name: self.push_string(Some(value.backup_file_name.as_str())),
+            backup_file_path: self.push_string(Some(&value.backup_file_path.to_string_lossy())),
             file_size: value.file_size,
             reason: static_slice(script_meta_backup_reason_string(value.reason)),
         }
@@ -3249,16 +4006,7 @@ impl SmkEditResult {
         let Some(value) = value.filter(|value| !value.is_empty()) else {
             return SmkUtf8Slice::empty();
         };
-        debug_assert!(
-            self.string_storage.len().saturating_add(value.len()) <= self.string_storage.capacity()
-        );
-        assert!(
-            self.string_storage.len().saturating_add(value.len()) <= self.string_storage.capacity(),
-            "SCRIPTMETAKit edit FFI string storage capacity was underestimated"
-        );
-        let start = self.string_storage.len();
-        self.string_storage.extend_from_slice(value.as_bytes());
-        borrowed_slice(&self.string_storage[start..])
+        push_stable_string(&mut self.string_storage, &mut self.string_overflow, value)
     }
 
     fn push_path(&mut self, path: &Path) -> SmkUtf8Slice {
@@ -3269,6 +4017,23 @@ impl SmkEditResult {
 
 fn static_slice(value: &'static str) -> SmkUtf8Slice {
     borrowed_slice(value.as_bytes())
+}
+
+fn push_stable_string(
+    storage: &mut Vec<u8>,
+    overflow: &mut Vec<Box<[u8]>>,
+    value: &str,
+) -> SmkUtf8Slice {
+    if storage.len().saturating_add(value.len()) <= storage.capacity() {
+        let start = storage.len();
+        storage.extend_from_slice(value.as_bytes());
+        return borrowed_slice(&storage[start..]);
+    }
+
+    let bytes = value.as_bytes().to_vec().into_boxed_slice();
+    let slice = borrowed_slice(&bytes);
+    overflow.push(bytes);
+    slice
 }
 
 fn total_file_entry_count(scan_result: &ScanResult) -> usize {
@@ -3318,7 +4083,13 @@ fn total_string_bytes(
             .filter(|item| !all_item_keys.contains(&(std::sync::Arc::as_ptr(item) as usize)))
             .map(|item| item_string_bytes(item))
             .sum::<usize>();
-        all_item_bytes + file_item_bytes
+        let candidate_record_bytes = snapshot
+            .candidate_cache
+            .records
+            .iter()
+            .map(candidate_record_string_bytes)
+            .sum::<usize>();
+        all_item_bytes + file_item_bytes + candidate_record_bytes
     });
     let change_bytes = scan_result
         .change_summary
@@ -3377,6 +4148,12 @@ fn file_entry_string_bytes(entry: &FileSystemEntry) -> usize {
         .saturating_add(entry.shebang.as_deref().map_or(0, str::len))
         .saturating_add(
             entry
+                .scriptmeta_item
+                .as_ref()
+                .map_or(0, |item| item_string_bytes(item)),
+        )
+        .saturating_add(
+            entry
                 .identity
                 .as_ref()
                 .map_or(0, file_identity_string_bytes),
@@ -3406,6 +4183,23 @@ fn item_string_bytes(item: &ScriptMetaItem) -> usize {
         item.author.as_deref().map_or(0, str::len),
         item.release_date.as_deref().map_or(0, str::len),
         item.edit_password_sha256.as_deref().map_or(0, str::len),
+    ]
+    .into_iter()
+    .fold(0usize, usize::saturating_add)
+}
+
+fn candidate_record_string_bytes(record: &CandidateRecord) -> usize {
+    [
+        record.root_id.len(),
+        record.root_path.to_string_lossy().len(),
+        record.file_path.to_string_lossy().len(),
+        record.identity_path.to_string_lossy().len(),
+        record.resolution_message.as_deref().map_or(0, str::len),
+        record.shebang.as_deref().map_or(0, str::len),
+        record
+            .item
+            .as_ref()
+            .map_or(0, |item| item_string_bytes(item)),
     ]
     .into_iter()
     .fold(0usize, usize::saturating_add)
@@ -3628,7 +4422,11 @@ fn script_metadata_draft_string_bytes(draft: &KitScriptMetadataDraft) -> usize {
 }
 
 fn backup_record_string_bytes(value: &KitScriptMetaBackupRecord) -> usize {
-    value.id.len().saturating_add(value.backup_file_name.len())
+    value
+        .id
+        .len()
+        .saturating_add(value.backup_file_name.len())
+        .saturating_add(value.backup_file_path.to_string_lossy().len())
 }
 
 fn backup_generation_string_bytes(value: &KitScriptMetaBackupGeneration) -> usize {
@@ -3782,6 +4580,24 @@ fn root_ids_from_raw(
         .collect::<Result<Vec<_>, _>>()
 }
 
+fn script_items_for_uniqueness_from_raw(
+    ptr: *const SmkScriptIdUniquenessItem,
+    len: usize,
+) -> Result<Vec<ScriptIdUniquenessItem>, (SmkStatus, String)> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if ptr.is_null() {
+        return Err((SmkStatus::NullArgument, "item slice is null".to_string()));
+    }
+    // SAFETY: the caller promises `ptr` points to `len` readable uniqueness items.
+    let items = unsafe { slice::from_raw_parts(ptr, len) };
+    items
+        .iter()
+        .map(script_item_for_uniqueness_from_ffi)
+        .collect::<Result<Vec<_>, _>>()
+}
+
 fn root_registration_from_ffi(
     root: &SmkRootRegistration,
 ) -> Result<RootRegistration, (SmkStatus, String)> {
@@ -3902,6 +4718,19 @@ fn script_item_from_ffi(item: &SmkScriptItem) -> Result<ScriptMetaItem, (SmkStat
         can_edit_scriptmeta: item.can_edit_scriptmeta != 0,
         can_append_scriptmeta: item.can_append_scriptmeta != 0,
         scriptmeta_edit_state: script_meta_edit_state_from_slice(item.scriptmeta_edit_state)?,
+    })
+}
+
+fn script_item_for_uniqueness_from_ffi(
+    item: &SmkScriptIdUniquenessItem,
+) -> Result<ScriptIdUniquenessItem, (SmkStatus, String)> {
+    let file_path = required_path_from_slice(item.file_path, "file_path")?;
+    let item_id = optional_string_from_slice(item.item_id)?
+        .unwrap_or_else(|| file_path.to_string_lossy().into_owned());
+    Ok(ScriptIdUniquenessItem {
+        item_id,
+        file_path,
+        script_id: optional_string_from_slice(item.script_id)?.unwrap_or_default(),
     })
 }
 
@@ -4032,6 +4861,19 @@ fn cache_policy_from_u32(value: u32) -> Result<CachePolicy, (SmkStatus, String)>
     }
 }
 
+fn cache_scope_from_u32(value: u32) -> Result<CacheScope, (SmkStatus, String)> {
+    match value {
+        0 => Ok(CacheScope::All),
+        1 => Ok(CacheScope::Catalog),
+        2 => Ok(CacheScope::FileList),
+        3 => Ok(CacheScope::Root),
+        _ => Err((
+            SmkStatus::InvalidArgument,
+            format!("unknown cache scope `{value}`"),
+        )),
+    }
+}
+
 fn refresh_policy_from_u32(value: u32) -> Result<RefreshPolicy, (SmkStatus, String)> {
     match value {
         0 => Ok(RefreshPolicy::ManualOnly),
@@ -4149,7 +4991,7 @@ fn operation_status(status: scriptmetakit::OperationStatus) -> &'static str {
 fn script_runtime_kind(kind: ScriptRuntimeKind) -> &'static str {
     match kind {
         ScriptRuntimeKind::AppleScript => "apple_script",
-        ScriptRuntimeKind::JavaScriptForAutomation => "javascript_for_automation",
+        ScriptRuntimeKind::JavaScriptForAutomation => "java_script_for_automation",
         ScriptRuntimeKind::AdobeJavaScript => "adobe_java_script",
         ScriptRuntimeKind::AdobeUxp => "adobe_uxp",
     }
@@ -4163,7 +5005,7 @@ fn optional_script_runtime_kind_from_slice(
     };
     match value {
         "apple_script" => Ok(Some(ScriptRuntimeKind::AppleScript)),
-        "javascript_for_automation" => Ok(Some(ScriptRuntimeKind::JavaScriptForAutomation)),
+        "java_script_for_automation" => Ok(Some(ScriptRuntimeKind::JavaScriptForAutomation)),
         "adobe_java_script" => Ok(Some(ScriptRuntimeKind::AdobeJavaScript)),
         "adobe_uxp" => Ok(Some(ScriptRuntimeKind::AdobeUxp)),
         _ => Err((
@@ -4190,6 +5032,45 @@ fn script_meta_edit_state_from_slice(
             SmkStatus::InvalidArgument,
             format!("unknown scriptmeta_edit_state `{value}`"),
         )),
+    }
+}
+
+fn smk_script_file_inspection(
+    value: ScriptFileInspection,
+    string_storage: &mut Vec<u8>,
+    string_overflow: &mut Vec<Box<[u8]>>,
+) -> SmkScriptFileInspection {
+    SmkScriptFileInspection {
+        is_supported_script_path: bool_byte(value.is_supported_script_path),
+        runtime_kind: value.runtime_kind.map_or_else(SmkUtf8Slice::empty, |kind| {
+            static_slice(script_runtime_kind(kind))
+        }),
+        shebang: value
+            .shebang
+            .as_deref()
+            .map_or_else(SmkUtf8Slice::empty, |shebang| {
+                push_stable_string(string_storage, string_overflow, shebang)
+            }),
+        comment_syntax: value
+            .comment_syntax
+            .map_or_else(SmkUtf8Slice::empty, |syntax| {
+                static_slice(comment_syntax(syntax))
+            }),
+        supports_inline_scriptmeta_editing: bool_byte(value.supports_inline_scriptmeta_editing),
+        is_file_locked: bool_byte(value.is_file_locked),
+        is_read_only: bool_byte(value.is_read_only),
+        can_edit_scriptmeta: bool_byte(value.can_edit_scriptmeta),
+        can_append_scriptmeta: bool_byte(value.can_append_scriptmeta),
+        scriptmeta_edit_state: static_slice(value.scriptmeta_edit_state.as_str()),
+    }
+}
+
+fn comment_syntax(syntax: CommentSyntax) -> &'static str {
+    match syntax {
+        CommentSyntax::JavaScriptBlock => "javascript_block",
+        CommentSyntax::AppleScriptBlock => "apple_script_block",
+        CommentSyntax::PlainText => "plain_text",
+        CommentSyntax::None => "",
     }
 }
 
@@ -4282,5 +5163,166 @@ fn script_meta_backup_reason_string(reason: ScriptMetaBackupReason) -> &'static 
         ScriptMetaBackupReason::BeforeSave => "before_save",
         ScriptMetaBackupReason::BeforeRestore => "before_restore",
         ScriptMetaBackupReason::ResetInitial => "reset_initial",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn slice_text(slice: SmkUtf8Slice) -> String {
+        if slice.len == 0 {
+            return String::new();
+        }
+        assert!(!slice.ptr.is_null());
+        // SAFETY: these tests only read slices returned by `push_stable_string`
+        // while the backing storage is still alive in the same scope.
+        let bytes = unsafe { slice::from_raw_parts(slice.ptr, slice.len) };
+        str::from_utf8(bytes)
+            .expect("slice should be valid UTF-8")
+            .to_string()
+    }
+
+    #[test]
+    fn push_stable_string_uses_arena_when_capacity_is_available() {
+        let mut storage = Vec::with_capacity("alpha".len() + "beta".len());
+        let mut overflow = Vec::new();
+
+        let first = push_stable_string(&mut storage, &mut overflow, "alpha");
+        let second = push_stable_string(&mut storage, &mut overflow, "beta");
+
+        assert_eq!(slice_text(first), "alpha");
+        assert_eq!(slice_text(second), "beta");
+        assert!(overflow.is_empty());
+    }
+
+    #[test]
+    fn push_stable_string_falls_back_without_reallocating_arena() {
+        let mut storage = Vec::with_capacity(0);
+        let mut overflow = Vec::new();
+
+        let first = push_stable_string(&mut storage, &mut overflow, "alpha");
+        let second = push_stable_string(&mut storage, &mut overflow, "beta");
+
+        assert_eq!(storage.capacity(), 0);
+        assert_eq!(overflow.len(), 2);
+        assert_eq!(slice_text(first), "alpha");
+        assert_eq!(slice_text(second), "beta");
+    }
+
+    #[test]
+    fn script_file_inspection_keeps_dynamic_shebang_storage() {
+        let result = SmkScriptFileInspectionResult::new(ScriptFileInspection {
+            is_supported_script_path: true,
+            runtime_kind: Some(ScriptRuntimeKind::JavaScriptForAutomation),
+            shebang: Some("#!/usr/bin/env osascript -l JavaScript".to_string()),
+            comment_syntax: Some(CommentSyntax::JavaScriptBlock),
+            supports_inline_scriptmeta_editing: true,
+            is_file_locked: false,
+            is_read_only: false,
+            can_edit_scriptmeta: true,
+            can_append_scriptmeta: false,
+            scriptmeta_edit_state: ScriptMetaEditState::Editable,
+        });
+
+        assert_eq!(
+            slice_text(result.inspection.shebang),
+            "#!/usr/bin/env osascript -l JavaScript"
+        );
+        assert_eq!(
+            slice_text(result.inspection.runtime_kind),
+            "java_script_for_automation"
+        );
+    }
+
+    #[test]
+    fn adobe_runtime_uses_core_serde_name() {
+        assert_eq!(
+            script_runtime_kind(ScriptRuntimeKind::AdobeJavaScript),
+            "adobe_java_script"
+        );
+    }
+
+    #[test]
+    fn script_id_uniqueness_result_exposes_duplicates_and_ignores_empty_ids() {
+        let report = scriptmetakit::validate_script_id_uniqueness(&[
+            uniqueness_item("/tmp/a.jsx", "com.example.same"),
+            uniqueness_item("/tmp/b.jsx", "com.example.same"),
+            uniqueness_item("/tmp/c.jsx", ""),
+            uniqueness_item("/tmp/d.jsx", ""),
+        ]);
+        let result = SmkScriptIdUniquenessResult::from_report(&report);
+
+        assert_eq!(result.report.total_items, 4);
+        assert_eq!(result.report.unique_script_ids, 1);
+        assert_eq!(result.report.duplicate_count, 1);
+        assert_eq!(result.duplicates.len(), 1);
+        assert_eq!(
+            slice_text(result.duplicates[0].script_id),
+            "com.example.same"
+        );
+        assert_eq!(result.duplicates[0].item_id_count, 2);
+        assert_eq!(result.duplicates[0].file_path_count, 2);
+
+        let item_ids = result
+            .item_ids
+            .iter()
+            .map(|slice| slice_text(*slice))
+            .collect::<Vec<_>>();
+        assert_eq!(item_ids, ["/tmp/a.jsx", "/tmp/b.jsx"]);
+    }
+
+    #[test]
+    fn script_id_uniqueness_ffi_uses_minimal_items() {
+        let items = [
+            ffi_uniqueness_item("/tmp/a.jsx", "com.example.same"),
+            ffi_uniqueness_item("/tmp/b.jsx", "com.example.same"),
+            ffi_uniqueness_item("/tmp/c.jsx", ""),
+        ];
+        let mut result = ptr::null_mut();
+
+        let status =
+            unsafe { smk_validate_script_id_uniqueness(items.as_ptr(), items.len(), &mut result) };
+
+        assert_eq!(status, SmkStatus::Ok);
+        assert!(!result.is_null());
+        let result_ref = unsafe { &*result };
+        assert_eq!(result_ref.report.total_items, 3);
+        assert_eq!(result_ref.report.unique_script_ids, 1);
+        assert_eq!(result_ref.duplicates.len(), 1);
+        assert_eq!(
+            slice_text(result_ref.duplicates[0].script_id),
+            "com.example.same"
+        );
+
+        unsafe {
+            smk_script_id_uniqueness_result_free(result);
+        }
+    }
+
+    fn uniqueness_item(file_path: &str, script_id: &str) -> scriptmetakit::ScriptIdUniquenessItem {
+        scriptmetakit::ScriptIdUniquenessItem {
+            item_id: file_path.to_string(),
+            file_path: PathBuf::from(file_path),
+            script_id: script_id.to_string(),
+        }
+    }
+
+    fn ffi_uniqueness_item(
+        file_path: &'static str,
+        script_id: &'static str,
+    ) -> SmkScriptIdUniquenessItem {
+        SmkScriptIdUniquenessItem {
+            item_id: input_slice(file_path),
+            file_path: input_slice(file_path),
+            script_id: input_slice(script_id),
+        }
+    }
+
+    fn input_slice(value: &'static str) -> SmkUtf8Slice {
+        SmkUtf8Slice {
+            ptr: value.as_ptr(),
+            len: value.len(),
+        }
     }
 }

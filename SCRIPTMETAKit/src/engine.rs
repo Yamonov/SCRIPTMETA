@@ -12,11 +12,11 @@ use crate::{
     RootId,
     catalog::{
         CacheInvalidationReason, CachePolicy, CacheScope, FileEntryChange, FileEntryChangeKind,
-        FileListSnapshot, RefreshPolicy, RefreshRequest, RootPurpose, RootRegistration,
-        RootSnapshot, RootStatus, ScanChangeSummary, ScanMode, ScanRequest, ScanResult,
-        ScriptMetaCatalogSnapshot, ScriptMetaKitConfig, ScriptMetaKitEvent, UpdateCheckProgress,
-        UpdateCheckProgressPhase, UpdateCheckRequest, UpdateCheckResult, UpdateFailure,
-        UpdateStatus, path_based_root_id, unresolved_distribution,
+        FileListSnapshot, RefreshPolicy, RefreshRequest, RootPriority, RootPurpose,
+        RootRegistration, RootSnapshot, RootStatus, ScanChangeSummary, ScanMode, ScanRequest,
+        ScanResult, ScriptMetaCatalogSnapshot, ScriptMetaKitConfig, ScriptMetaKitEvent,
+        UpdateCheckProgress, UpdateCheckProgressPhase, UpdateCheckRequest, UpdateCheckResult,
+        UpdateFailure, UpdateStatus, path_based_root_id, unresolved_distribution,
     },
     core::{
         FileIssue, OperationCancellation, OperationSummary, ScriptMetaItem, ScriptMetaItemRef,
@@ -33,8 +33,8 @@ use crate::{
     },
     storage::CachePayload,
     watcher::{
-        ChangeRoutingOptions, RawChangeBatch, WatchPlan, build_watch_plan, normalize_path,
-        route_change_batch,
+        ChangeRoutingOptions, RawChangeBatch, WatchPlan, WatchPolicy, build_watch_plan,
+        normalize_path, route_change_batch,
     },
 };
 
@@ -42,6 +42,7 @@ use crate::{
 pub struct ScriptMetaKitEngine {
     config: ScriptMetaKitConfig,
     roots: Vec<RootRegistration>,
+    root_groups: BTreeMap<String, BTreeMap<RootId, RootRegistration>>,
     visible_root_id: Option<RootId>,
     root_snapshots: BTreeMap<RootId, RootSnapshot>,
     file_list_snapshots: BTreeMap<RootId, Arc<FileListSnapshot>>,
@@ -78,6 +79,7 @@ impl ScriptMetaKitEngine {
         Ok(Self {
             config,
             roots: Vec::new(),
+            root_groups: BTreeMap::new(),
             visible_root_id: None,
             root_snapshots: BTreeMap::new(),
             file_list_snapshots: BTreeMap::new(),
@@ -100,6 +102,57 @@ impl ScriptMetaKitEngine {
     }
 
     pub fn set_roots(
+        &mut self,
+        roots: Vec<RootRegistration>,
+    ) -> ScriptMetaKitResult<Vec<ScriptMetaKitEvent>> {
+        self.root_groups.clear();
+        self.apply_roots(roots)
+    }
+
+    pub fn replace_root_group(
+        &mut self,
+        group_id: impl Into<String>,
+        roots: Vec<RootRegistration>,
+    ) -> ScriptMetaKitResult<Vec<ScriptMetaKitEvent>> {
+        self.expire_idle_memory_cache();
+        let group_id = group_id.into();
+        if roots.is_empty() {
+            self.root_groups.remove(&group_id);
+        } else {
+            self.root_groups.insert(group_id, root_map(roots)?);
+        }
+        self.apply_grouped_roots()
+    }
+
+    pub fn insert_roots_into_group(
+        &mut self,
+        group_id: impl Into<String>,
+        roots: Vec<RootRegistration>,
+    ) -> ScriptMetaKitResult<Vec<ScriptMetaKitEvent>> {
+        self.expire_idle_memory_cache();
+        let group = self.root_groups.entry(group_id.into()).or_default();
+        for root in roots {
+            group.insert(root.root_id.clone(), root);
+        }
+        self.apply_grouped_roots()
+    }
+
+    fn apply_grouped_roots(&mut self) -> ScriptMetaKitResult<Vec<ScriptMetaKitEvent>> {
+        let mut merged_roots_by_id: BTreeMap<RootId, RootRegistration> = BTreeMap::new();
+        for group_roots in self.root_groups.values() {
+            for root in group_roots.values() {
+                merged_roots_by_id
+                    .entry(root.root_id.clone())
+                    .and_modify(|existing| {
+                        *existing = merged_root_registration(existing, root);
+                    })
+                    .or_insert_with(|| root.clone());
+            }
+        }
+        self.apply_roots(merged_roots_by_id.into_values().collect())
+    }
+
+    fn apply_roots(
         &mut self,
         roots: Vec<RootRegistration>,
     ) -> ScriptMetaKitResult<Vec<ScriptMetaKitEvent>> {
@@ -263,6 +316,45 @@ impl ScriptMetaKitEngine {
         self.scan_roots_inner(request, None)
     }
 
+    #[must_use]
+    pub fn cached_scan_result(&mut self, request: ScanRequest) -> ScanResult {
+        self.expire_idle_memory_cache();
+        let selected_root_indices = self.selected_root_indices(&request.root_ids);
+        let root_ids: Vec<_> = selected_root_indices
+            .iter()
+            .map(|index| self.roots[*index].root_id.clone())
+            .collect();
+        let roots = self.snapshots_for_roots(&root_ids);
+        let file_list_snapshots = if request.mode.includes_file_list() {
+            self.file_list_snapshots_for_roots(&root_ids)
+        } else {
+            Vec::new()
+        };
+        let catalog_snapshot = request
+            .mode
+            .includes_metadata()
+            .then(|| self.catalog_snapshot.clone())
+            .flatten();
+        let operation = scan_operation_summary(&roots);
+        let file_issues =
+            collect_scan_file_issues(&roots, &file_list_snapshots, catalog_snapshot.as_deref());
+
+        ScanResult {
+            roots,
+            file_list_snapshots,
+            catalog_snapshot,
+            operation,
+            file_issues,
+            update_check_result: request
+                .mode
+                .includes_metadata()
+                .then(|| self.update_check_result.clone())
+                .flatten(),
+            change_summary: None,
+            watch_change_batch: None,
+        }
+    }
+
     pub fn cancel_current_operation(&self) {
         self.cancellation.cancel();
     }
@@ -349,25 +441,65 @@ impl ScriptMetaKitEngine {
                 self.root_snapshots
                     .insert(root.root_id.clone(), root.clone());
             }
+            let refreshed_root_ids = metadata_root_indices
+                .iter()
+                .map(|index| self.roots[*index].root_id.clone())
+                .collect::<BTreeSet<_>>();
+            let scan_roots = output.roots;
+            let scan_candidate_cache = output.candidate_cache;
+            let scan_file_items = file_items_from_cache(&scan_candidate_cache);
+            let scan_all_items = deduplicated_items(&scan_file_items);
+
+            let mut stored_roots = scan_roots.clone();
+            let mut stored_candidate_cache = scan_candidate_cache.clone();
+            let mut return_stored_snapshot = true;
+            if let Some(previous_snapshot) = self.catalog_snapshot.as_ref() {
+                return_stored_snapshot = false;
+                stored_roots = merged_catalog_roots(
+                    previous_snapshot.as_ref(),
+                    stored_roots,
+                    &refreshed_root_ids,
+                );
+                stored_candidate_cache = merged_candidate_cache(
+                    previous_snapshot.as_ref(),
+                    stored_candidate_cache,
+                    &refreshed_root_ids,
+                    &self.roots,
+                    root_allows_memory_cache,
+                );
+            }
+            let stored_file_items = file_items_from_cache(&stored_candidate_cache);
+            let stored_all_items = deduplicated_items(&stored_file_items);
             let update_check_result = self.preserved_update_result(
                 self.catalog_snapshot.as_deref(),
                 self.update_check_result.as_deref(),
-                &output.file_items,
+                &stored_file_items,
             );
-            let snapshot = Arc::new(ScriptMetaCatalogSnapshot {
+            let stored_snapshot = Arc::new(ScriptMetaCatalogSnapshot {
                 source_revision: output.source_revision,
-                roots: output.roots,
-                all_items: output.all_items,
-                file_items: output.file_items,
-                candidate_cache: output.candidate_cache,
+                roots: stored_roots,
+                all_items: stored_all_items,
+                file_items: stored_file_items,
+                candidate_cache: stored_candidate_cache,
             });
+            let snapshot = if return_stored_snapshot {
+                Arc::clone(&stored_snapshot)
+            } else {
+                Arc::new(ScriptMetaCatalogSnapshot {
+                    source_revision: output.source_revision,
+                    roots: scan_roots,
+                    all_items: scan_all_items,
+                    file_items: scan_file_items,
+                    candidate_cache: scan_candidate_cache,
+                })
+            };
             if request.mode.includes_file_list() {
                 apply_metadata_capabilities_to_file_list_snapshots(
                     &mut file_list_snapshots,
-                    &snapshot.candidate_cache.records,
+                    &stored_snapshot.candidate_cache.records,
                 );
             }
-            self.store_catalog_snapshot_if_allowed(&snapshot, update_check_result);
+            self.store_catalog_snapshot_if_allowed(&stored_snapshot, update_check_result);
             Some(snapshot)
         } else {
             None
@@ -943,27 +1075,20 @@ impl ScriptMetaKitEngine {
         let payload = payload.migrate()?;
         payload.validate_for_config(&self.config)?;
         match payload.scope {
-            CacheScope::Catalog | CacheScope::All => {
-                let CatalogCacheData {
-                    mut catalog_snapshot,
-                    update_check_result,
-                } = decode_catalog_cache_data(payload.data)?;
-                validate_catalog_cache_roots(
-                    &catalog_snapshot.candidate_cache,
-                    &self.roots,
-                    root_allows_persistent_catalog_cache,
-                )?;
-                let file_items = file_items_from_cache(&catalog_snapshot.candidate_cache);
-                catalog_snapshot.all_items = deduplicated_items(&file_items);
-                catalog_snapshot.file_items = file_items;
-                let catalog_snapshot =
-                    self.catalog_snapshot_for_policy(&catalog_snapshot, root_allows_memory_cache);
-                self.update_check_result = update_check_result.as_ref().and_then(|result| {
-                    filter_update_result_to_items(result, &catalog_snapshot.file_items)
-                });
-                self.catalog_snapshot = Some(Arc::new(catalog_snapshot));
-                self.enforce_memory_node_limit();
-                self.touch_memory_cache_if_needed();
+            CacheScope::All => {
+                let all_data = decode_all_cache_data(payload.data)?;
+                if let Some(catalog) = all_data.catalog
+                    && !catalog.is_null()
+                {
+                    self.load_catalog_cache_data(decode_catalog_cache_data(catalog)?)?;
+                }
+                self.load_file_list_cache_snapshots(all_data.file_list_snapshots)?;
+                Ok(vec![ScriptMetaKitEvent::CacheLoaded {
+                    scope: CacheScope::All,
+                }])
+            }
+            CacheScope::Catalog => {
+                self.load_catalog_cache_data(decode_catalog_cache_data(payload.data)?)?;
                 Ok(vec![ScriptMetaKitEvent::CacheLoaded {
                     scope: CacheScope::Catalog,
                 }])
@@ -972,20 +1097,7 @@ impl ScriptMetaKitEngine {
                 let snapshots: BTreeMap<RootId, Arc<FileListSnapshot>> =
                     serde_json::from_value(payload.data)
                         .map_err(|error| ScriptMetaKitError::Cache(error.to_string()))?;
-                validate_file_list_cache_roots(
-                    snapshots.keys(),
-                    &self.roots,
-                    root_allows_persistent_file_list_cache,
-                )?;
-                for (root_id, snapshot) in snapshots {
-                    if self.should_store_file_list_snapshot(&root_id) {
-                        self.root_snapshots
-                            .insert(root_id.clone(), snapshot.root.clone());
-                        self.file_list_snapshots.insert(root_id, snapshot);
-                    }
-                }
-                self.enforce_memory_node_limit();
-                self.touch_memory_cache_if_needed();
+                self.load_file_list_cache_snapshots(snapshots)?;
                 Ok(vec![ScriptMetaKitEvent::CacheLoaded {
                     scope: payload.scope,
                 }])
@@ -1000,53 +1112,20 @@ impl ScriptMetaKitEngine {
             ));
         }
         match scope {
-            CacheScope::Catalog | CacheScope::All => {
-                let data = if let Some(snapshot) = self.catalog_snapshot.as_ref() {
-                    let snapshot = self.catalog_snapshot_for_policy(
-                        snapshot.as_ref(),
-                        root_allows_persistent_catalog_cache,
-                    );
-                    let update_check_result =
-                        self.update_check_result.as_ref().and_then(|result| {
-                            filter_update_result_to_items(result, &snapshot.file_items)
-                        });
-                    serde_json::to_value(CatalogCacheDataRef {
-                        catalog_snapshot: &snapshot,
-                        update_check_result: update_check_result.as_deref(),
-                    })
-                } else {
-                    let persistent_roots = self
-                        .roots
-                        .iter()
-                        .filter(|root| root_allows_persistent_catalog_cache(root))
-                        .collect::<Vec<_>>();
-                    let snapshot = ScriptMetaCatalogSnapshot {
-                        source_revision: Uuid::new_v4(),
-                        roots: self
-                            .root_snapshots
-                            .values()
-                            .filter(|snapshot| {
-                                persistent_roots
-                                    .iter()
-                                    .any(|root| root.root_id == snapshot.root_id)
-                            })
-                            .cloned()
-                            .collect(),
-                        all_items: Vec::new(),
-                        file_items: Vec::new(),
-                        candidate_cache: CandidateCache {
-                            schema_version: CandidateCache::CURRENT_SCHEMA_VERSION,
-                            built_at: now_timestamp_millis(),
-                            registered_roots: registered_root_signatures(&persistent_roots),
-                            records: Vec::new(),
-                        },
-                    };
-                    serde_json::to_value(CatalogCacheDataRef {
-                        catalog_snapshot: &snapshot,
-                        update_check_result: None,
-                    })
-                }
+            CacheScope::All => {
+                let data = serde_json::to_value(AllCacheDataRef {
+                    catalog: self.catalog_cache_data()?,
+                    file_list_snapshots: &self.persistent_file_list_cache_snapshots(),
+                })
                 .map_err(|error| ScriptMetaKitError::Cache(error.to_string()))?;
+                Ok(CachePayload::new_for_config(
+                    CacheScope::All,
+                    data,
+                    &self.config,
+                ))
+            }
+            CacheScope::Catalog => {
+                let data = self.catalog_cache_data()?;
                 Ok(CachePayload::new_for_config(
                     CacheScope::Catalog,
                     data,
@@ -1054,20 +1133,121 @@ impl ScriptMetaKitEngine {
                 ))
             }
             CacheScope::FileList | CacheScope::Root => {
-                let snapshots = self
-                    .file_list_snapshots
-                    .iter()
-                    .filter(|(root_id, _)| {
-                        self.root_by_id(root_id)
-                            .is_some_and(root_allows_persistent_file_list_cache)
-                    })
-                    .map(|(root_id, snapshot)| (root_id.clone(), Arc::clone(snapshot)))
-                    .collect::<BTreeMap<_, _>>();
+                let snapshots = self.persistent_file_list_cache_snapshots();
                 let data = serde_json::to_value(&snapshots)
                     .map_err(|error| ScriptMetaKitError::Cache(error.to_string()))?;
                 Ok(CachePayload::new_for_config(scope, data, &self.config))
             }
         }
+    }
+
+    fn load_catalog_cache_data(&mut self, data: CatalogCacheData) -> ScriptMetaKitResult<()> {
+        let CatalogCacheData {
+            mut catalog_snapshot,
+            update_check_result,
+        } = data;
+        validate_catalog_cache_roots(
+            &catalog_snapshot.candidate_cache,
+            &self.roots,
+            root_allows_persistent_catalog_cache,
+        )?;
+        let file_items = file_items_from_cache(&catalog_snapshot.candidate_cache);
+        catalog_snapshot.all_items = deduplicated_items(&file_items);
+        catalog_snapshot.file_items = file_items;
+        let catalog_snapshot =
+            self.catalog_snapshot_for_policy(&catalog_snapshot, root_allows_memory_cache);
+        self.update_check_result = update_check_result
+            .as_ref()
+            .and_then(|result| filter_update_result_to_items(result, &catalog_snapshot.file_items));
+        self.catalog_snapshot = Some(Arc::new(catalog_snapshot));
+        self.enforce_memory_node_limit();
+        self.touch_memory_cache_if_needed();
+        Ok(())
+    }
+
+    fn load_file_list_cache_snapshots(
+        &mut self,
+        snapshots: BTreeMap<RootId, Arc<FileListSnapshot>>,
+    ) -> ScriptMetaKitResult<()> {
+        for (root_id, snapshot) in snapshots {
+            let Some(root) = self.root_by_id(&root_id) else {
+                continue;
+            };
+            if !root_allows_persistent_file_list_cache(root)
+                || normalize_path(&snapshot.root.path) != normalize_path(&root.path)
+            {
+                continue;
+            }
+            if self.should_store_file_list_snapshot(&root_id) {
+                self.root_snapshots
+                    .insert(root_id.clone(), snapshot.root.clone());
+                self.file_list_snapshots.insert(root_id, snapshot);
+            }
+        }
+        self.enforce_memory_node_limit();
+        self.touch_memory_cache_if_needed();
+        Ok(())
+    }
+
+    fn catalog_cache_data(&self) -> ScriptMetaKitResult<serde_json::Value> {
+        let data = if let Some(snapshot) = self.catalog_snapshot.as_ref() {
+            let snapshot = self.catalog_snapshot_for_policy(
+                snapshot.as_ref(),
+                root_allows_persistent_catalog_cache,
+            );
+            let update_check_result = self
+                .update_check_result
+                .as_ref()
+                .and_then(|result| filter_update_result_to_items(result, &snapshot.file_items));
+            serde_json::to_value(CatalogCacheDataRef {
+                catalog_snapshot: &snapshot,
+                update_check_result: update_check_result.as_deref(),
+            })
+        } else {
+            let persistent_roots = self
+                .roots
+                .iter()
+                .filter(|root| root_allows_persistent_catalog_cache(root))
+                .collect::<Vec<_>>();
+            let snapshot = ScriptMetaCatalogSnapshot {
+                source_revision: Uuid::new_v4(),
+                roots: self
+                    .root_snapshots
+                    .values()
+                    .filter(|snapshot| {
+                        persistent_roots
+                            .iter()
+                            .any(|root| root.root_id == snapshot.root_id)
+                    })
+                    .cloned()
+                    .collect(),
+                all_items: Vec::new(),
+                file_items: Vec::new(),
+                candidate_cache: CandidateCache {
+                    schema_version: CandidateCache::CURRENT_SCHEMA_VERSION,
+                    built_at: now_timestamp_millis(),
+                    registered_roots: registered_root_signatures(&persistent_roots),
+                    records: Vec::new(),
+                },
+            };
+            serde_json::to_value(CatalogCacheDataRef {
+                catalog_snapshot: &snapshot,
+                update_check_result: None,
+            })
+        }
+        .map_err(|error| ScriptMetaKitError::Cache(error.to_string()))?;
+        Ok(data)
+    }
+
+    fn persistent_file_list_cache_snapshots(&self) -> BTreeMap<RootId, Arc<FileListSnapshot>> {
+        self.file_list_snapshots
+            .iter()
+            .filter(|(root_id, _)| {
+                self.root_by_id(root_id)
+                    .is_some_and(root_allows_persistent_file_list_cache)
+            })
+            .map(|(root_id, snapshot)| (root_id.clone(), Arc::clone(snapshot)))
+            .collect::<BTreeMap<_, _>>()
     }
 
     pub fn invalidate_cache(
@@ -1263,6 +1443,7 @@ impl ScriptMetaKitEngine {
     fn watch_plan_with_delivery_options(&self, mut plan: WatchPlan) -> WatchPlan {
         plan.debounce_delay_millis = self.config.watcher.debounce_delay_millis;
         plan.max_delivery_delay_millis = self.config.watcher.max_delivery_delay_millis;
+        plan.native_event_latency_millis = self.config.watcher.native_event_latency_millis;
         plan.max_pending_paths = self.config.watcher.max_pending_paths;
         plan.supported_extensions = self.config.supported_extensions.clone();
         plan.skip_hidden_paths = self.config.scanner.skip_hidden;
@@ -1597,11 +1778,180 @@ impl ScriptMetaKitEngine {
     }
 }
 
+fn root_map(
+    roots: Vec<RootRegistration>,
+) -> ScriptMetaKitResult<BTreeMap<RootId, RootRegistration>> {
+    let mut roots_by_id = BTreeMap::new();
+    for root in roots {
+        if roots_by_id.insert(root.root_id.clone(), root).is_some() {
+            return Err(ScriptMetaKitError::InvalidConfig(
+                "root_id values must be unique".to_string(),
+            ));
+        }
+    }
+    Ok(roots_by_id)
+}
+
+fn merged_root_registration(
+    existing: &RootRegistration,
+    next: &RootRegistration,
+) -> RootRegistration {
+    RootRegistration {
+        root_id: next.root_id.clone(),
+        path: merged_root_path(existing, next),
+        display_name: merged_display_name(existing, next),
+        purpose: merged_root_purpose(existing.purpose, next.purpose),
+        watch_policy: merged_watch_policy(existing.watch_policy, next.watch_policy),
+        cache_policy: merged_cache_policy(existing.cache_policy, next.cache_policy),
+        refresh_policy: merged_refresh_policy(existing.refresh_policy, next.refresh_policy),
+        priority: merged_root_priority(existing.priority, next.priority),
+    }
+}
+
+fn merged_root_path(existing: &RootRegistration, next: &RootRegistration) -> PathBuf {
+    if next.purpose.includes_file_list() {
+        next.path.clone()
+    } else {
+        existing.path.clone()
+    }
+}
+
+fn merged_display_name(existing: &RootRegistration, next: &RootRegistration) -> Option<String> {
+    if next.purpose.includes_file_list() || existing.display_name.is_none() {
+        next.display_name
+            .clone()
+            .or_else(|| existing.display_name.clone())
+    } else {
+        existing
+            .display_name
+            .clone()
+            .or_else(|| next.display_name.clone())
+    }
+}
+
+fn merged_root_purpose(lhs: RootPurpose, rhs: RootPurpose) -> RootPurpose {
+    if lhs == rhs {
+        return lhs;
+    }
+    if lhs == RootPurpose::FileListAndMetadata || rhs == RootPurpose::FileListAndMetadata {
+        return RootPurpose::FileListAndMetadata;
+    }
+    if matches!(
+        (lhs, rhs),
+        (RootPurpose::FileList, RootPurpose::MetadataCatalog)
+            | (RootPurpose::MetadataCatalog, RootPurpose::FileList)
+    ) {
+        return RootPurpose::FileListAndMetadata;
+    }
+    rhs
+}
+
+fn merged_watch_policy(lhs: WatchPolicy, rhs: WatchPolicy) -> WatchPolicy {
+    if lhs == WatchPolicy::AllRegistered || rhs == WatchPolicy::AllRegistered {
+        return WatchPolicy::AllRegistered;
+    }
+    if lhs == WatchPolicy::VisibleOnly || rhs == WatchPolicy::VisibleOnly {
+        return WatchPolicy::VisibleOnly;
+    }
+    if lhs == WatchPolicy::Manual || rhs == WatchPolicy::Manual {
+        return WatchPolicy::Manual;
+    }
+    WatchPolicy::Disabled
+}
+
+fn merged_cache_policy(lhs: CachePolicy, rhs: CachePolicy) -> CachePolicy {
+    if lhs == CachePolicy::MemoryAndPersistent || rhs == CachePolicy::MemoryAndPersistent {
+        return CachePolicy::MemoryAndPersistent;
+    }
+    if lhs == CachePolicy::MemoryOnly || rhs == CachePolicy::MemoryOnly {
+        return CachePolicy::MemoryOnly;
+    }
+    if lhs == CachePolicy::PersistentCatalogOnly || rhs == CachePolicy::PersistentCatalogOnly {
+        return CachePolicy::PersistentCatalogOnly;
+    }
+    CachePolicy::Disabled
+}
+
+fn merged_refresh_policy(lhs: RefreshPolicy, rhs: RefreshPolicy) -> RefreshPolicy {
+    if lhs == RefreshPolicy::OnFileEventDeferred || rhs == RefreshPolicy::OnFileEventDeferred {
+        return RefreshPolicy::OnFileEventDeferred;
+    }
+    if lhs == RefreshPolicy::OnFileEvent || rhs == RefreshPolicy::OnFileEvent {
+        return RefreshPolicy::OnFileEvent;
+    }
+    if lhs == RefreshPolicy::OnVisible || rhs == RefreshPolicy::OnVisible {
+        return RefreshPolicy::OnVisible;
+    }
+    if lhs == RefreshPolicy::Scheduled || rhs == RefreshPolicy::Scheduled {
+        return RefreshPolicy::Scheduled;
+    }
+    RefreshPolicy::ManualOnly
+}
+
+fn merged_root_priority(lhs: RootPriority, rhs: RootPriority) -> RootPriority {
+    if lhs == RootPriority::UserInitiated || rhs == RootPriority::UserInitiated {
+        return RootPriority::UserInitiated;
+    }
+    if lhs == RootPriority::VisibleWhenSelected || rhs == RootPriority::VisibleWhenSelected {
+        return RootPriority::VisibleWhenSelected;
+    }
+    RootPriority::Background
+}
+
 fn root_allows_memory_cache(root: &RootRegistration) -> bool {
     matches!(
         root.cache_policy,
         CachePolicy::MemoryOnly | CachePolicy::MemoryAndPersistent
     )
+}
+
+fn merged_catalog_roots(
+    previous: &ScriptMetaCatalogSnapshot,
+    mut refreshed_roots: Vec<RootSnapshot>,
+    refreshed_root_ids: &BTreeSet<RootId>,
+) -> Vec<RootSnapshot> {
+    let mut roots = previous
+        .roots
+        .iter()
+        .filter(|root| !refreshed_root_ids.contains(&root.root_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    roots.append(&mut refreshed_roots);
+    roots.sort_by(|lhs, rhs| lhs.root_id.cmp(&rhs.root_id));
+    roots
+}
+
+fn merged_candidate_cache(
+    previous: &ScriptMetaCatalogSnapshot,
+    refreshed: CandidateCache,
+    refreshed_root_ids: &BTreeSet<RootId>,
+    roots: &[RootRegistration],
+    allows_root: impl Fn(&RootRegistration) -> bool,
+) -> CandidateCache {
+    let CandidateCache {
+        built_at,
+        records: refreshed_records,
+        ..
+    } = refreshed;
+    let mut records = previous
+        .candidate_cache
+        .records
+        .iter()
+        .filter(|record| !refreshed_root_ids.contains(&record.root_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    records.extend(refreshed_records);
+    records.sort_by(|lhs, rhs| lhs.identity_path.cmp(&rhs.identity_path));
+    let registered_roots = roots
+        .iter()
+        .filter(|root| allows_root(root))
+        .collect::<Vec<_>>();
+    CandidateCache {
+        schema_version: CandidateCache::CURRENT_SCHEMA_VERSION,
+        built_at,
+        registered_roots: registered_root_signatures(&registered_roots),
+        records,
+    }
 }
 
 fn root_allows_persistent_catalog_cache(root: &RootRegistration) -> bool {
@@ -1635,29 +1985,6 @@ fn validate_catalog_cache_roots(
         return Err(ScriptMetaKitError::Cache(
             "cache root signature does not match registered roots".to_string(),
         ));
-    }
-    Ok(())
-}
-
-fn validate_file_list_cache_roots<'a>(
-    cached_root_ids: impl Iterator<Item = &'a RootId>,
-    roots: &[RootRegistration],
-    allows_root: impl Fn(&RootRegistration) -> bool,
-) -> ScriptMetaKitResult<()> {
-    let allowed = roots
-        .iter()
-        .filter(|root| allows_root(root))
-        .map(|root| root.root_id.as_ref())
-        .collect::<BTreeSet<_>>();
-    let unknown = cached_root_ids
-        .filter(|root_id| !allowed.contains(root_id.as_ref()))
-        .cloned()
-        .collect::<Vec<_>>();
-    if !unknown.is_empty() {
-        return Err(ScriptMetaKitError::Cache(format!(
-            "cache contains unregistered or non-cacheable roots: {}",
-            unknown.join(", ")
-        )));
     }
     Ok(())
 }
@@ -1855,19 +2182,6 @@ fn collect_file_entry_issues(
                 is_directory: entry.is_directory,
             });
         }
-        if entry.scriptmeta_edit_state == crate::core::ScriptMetaEditState::Obfuscated {
-            output.push(FileIssue {
-                root_id: Some(root_id.to_string()),
-                path: entry.display_path.clone(),
-                code: "binary_or_obfuscated".to_string(),
-                message:
-                    "script metadata cannot be edited inline for this binary or obfuscated file"
-                        .to_string(),
-                path_kind: Some(entry.path_kind.as_str().to_string()),
-                resolution_status: Some(entry.resolution_status.as_str().to_string()),
-                is_directory: entry.is_directory,
-            });
-        }
         collect_file_entry_issues(root_id, &entry.children, output);
     }
 }
@@ -1931,6 +2245,32 @@ struct CatalogCacheDataRef<'a> {
     catalog_snapshot: &'a ScriptMetaCatalogSnapshot,
     #[serde(skip_serializing_if = "Option::is_none")]
     update_check_result: Option<&'a UpdateCheckResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AllCacheData {
+    #[serde(default)]
+    catalog: Option<serde_json::Value>,
+    #[serde(default)]
+    file_list_snapshots: BTreeMap<RootId, Arc<FileListSnapshot>>,
+}
+
+#[derive(Debug, Serialize)]
+struct AllCacheDataRef<'a> {
+    catalog: serde_json::Value,
+    file_list_snapshots: &'a BTreeMap<RootId, Arc<FileListSnapshot>>,
+}
+
+fn decode_all_cache_data(data: serde_json::Value) -> ScriptMetaKitResult<AllCacheData> {
+    if data.get("catalog").is_some() || data.get("file_list_snapshots").is_some() {
+        return serde_json::from_value(data)
+            .map_err(|error| ScriptMetaKitError::Cache(error.to_string()));
+    }
+
+    Ok(AllCacheData {
+        catalog: Some(data),
+        file_list_snapshots: BTreeMap::new(),
+    })
 }
 
 fn decode_catalog_cache_data(data: serde_json::Value) -> ScriptMetaKitResult<CatalogCacheData> {
@@ -2270,6 +2610,7 @@ fn file_entry_changed(lhs: &FileSystemEntry, rhs: &FileSystemEntry) -> bool {
         || lhs.can_edit_scriptmeta != rhs.can_edit_scriptmeta
         || lhs.can_append_scriptmeta != rhs.can_append_scriptmeta
         || lhs.scriptmeta_edit_state != rhs.scriptmeta_edit_state
+        || lhs.scriptmeta_item != rhs.scriptmeta_item
 }
 
 fn apply_metadata_capabilities_to_file_list_snapshots(
@@ -2325,6 +2666,7 @@ fn apply_metadata_capabilities_to_entries(
             entry.can_edit_scriptmeta = record.can_edit_scriptmeta;
             entry.can_append_scriptmeta = record.can_append_scriptmeta;
             entry.scriptmeta_edit_state = record.scriptmeta_edit_state;
+            entry.scriptmeta_item = record.item.as_ref().map(Arc::clone);
         }
         apply_metadata_capabilities_to_entries(
             root_id,
@@ -2337,15 +2679,70 @@ fn apply_metadata_capabilities_to_entries(
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, sync::Arc};
+    use std::{path::Path, path::PathBuf, sync::Arc};
 
     use url::Url;
 
-    use super::update_work_groups;
+    use super::{
+        apply_metadata_capabilities_to_file_list_snapshots, decode_all_cache_data,
+        update_work_groups,
+    };
     use crate::{
         RootId,
+        catalog::{
+            CachePolicy, FileListSnapshot, RefreshPolicy, RootPriority, RootPurpose,
+            RootRegistration, RootSnapshot,
+        },
         core::{ScriptMetaEditState, ScriptMetaItem},
+        scanner::{CandidateRecord, FileSystemEntry, PathKind, PathResolutionStatus},
+        watcher::WatchPolicy,
     };
+
+    #[test]
+    fn root_groups_recompute_merged_roots_when_group_is_replaced() {
+        let mut engine = super::ScriptMetaKitEngine::new(Default::default()).expect("engine");
+        let metadata_root = RootRegistration {
+            root_id: RootId::from("shared"),
+            path: PathBuf::from("/tmp/root"),
+            display_name: Some("Metadata".to_string()),
+            purpose: RootPurpose::MetadataCatalog,
+            watch_policy: WatchPolicy::Disabled,
+            cache_policy: CachePolicy::PersistentCatalogOnly,
+            refresh_policy: RefreshPolicy::ManualOnly,
+            priority: RootPriority::Background,
+        };
+        let file_list_root = RootRegistration {
+            purpose: RootPurpose::FileList,
+            display_name: Some("Files".to_string()),
+            watch_policy: WatchPolicy::AllRegistered,
+            cache_policy: CachePolicy::MemoryAndPersistent,
+            refresh_policy: RefreshPolicy::OnFileEventDeferred,
+            priority: RootPriority::UserInitiated,
+            ..metadata_root.clone()
+        };
+
+        engine
+            .replace_root_group("metadata", vec![metadata_root.clone()])
+            .expect("metadata roots");
+        engine
+            .insert_roots_into_group("file-list", vec![file_list_root])
+            .expect("file list roots");
+
+        assert_eq!(engine.roots().len(), 1);
+        let merged = &engine.roots()[0];
+        assert_eq!(merged.purpose, RootPurpose::FileListAndMetadata);
+        assert_eq!(merged.display_name.as_deref(), Some("Files"));
+        assert_eq!(merged.watch_policy, WatchPolicy::AllRegistered);
+        assert_eq!(merged.cache_policy, CachePolicy::MemoryAndPersistent);
+        assert_eq!(merged.refresh_policy, RefreshPolicy::OnFileEventDeferred);
+        assert_eq!(merged.priority, RootPriority::UserInitiated);
+
+        engine
+            .replace_root_group("file-list", Vec::new())
+            .expect("remove file list roots");
+
+        assert_eq!(engine.roots(), &[metadata_root]);
+    }
 
     #[test]
     fn groups_update_work_by_meta_url_only_for_checkable_items() {
@@ -2382,6 +2779,126 @@ mod tests {
             min_target_version: None,
             meta_url: meta_url.map(|url| Url::parse(url).expect("valid test URL")),
             name: None,
+            author: None,
+            release_date: None,
+            edit_password_sha256: None,
+            has_scriptmeta: true,
+            has_scriptmeta_edit_password: false,
+            is_file_locked: false,
+            is_read_only: false,
+            can_edit_scriptmeta: true,
+            can_append_scriptmeta: false,
+            scriptmeta_edit_state: ScriptMetaEditState::Editable,
+        })
+    }
+
+    #[test]
+    fn attaches_scriptmeta_item_to_matching_file_entry() {
+        let root_id = RootId::from("root");
+        let file_path = PathBuf::from("/tmp/root/sample.jsx");
+        let item = script_item_at_path("sample", &root_id, &file_path);
+        let record = CandidateRecord {
+            root_id: root_id.clone(),
+            root_path: Arc::new(PathBuf::from("/tmp/root")),
+            file_path: file_path.clone(),
+            identity_path: file_path.clone(),
+            path_kind: PathKind::Normal,
+            resolution_status: PathResolutionStatus::Resolved,
+            resolution_message: None,
+            runtime_kind: None,
+            shebang: None,
+            has_scriptmeta: true,
+            has_scriptmeta_edit_password: false,
+            is_file_locked: false,
+            is_read_only: false,
+            can_edit_scriptmeta: true,
+            can_append_scriptmeta: false,
+            scriptmeta_edit_state: ScriptMetaEditState::Editable,
+            file_size: Some(42),
+            content_modified_at: Some(1_000),
+            identity: None,
+            item: Some(Arc::clone(&item)),
+        };
+        let mut snapshots = vec![FileListSnapshot {
+            root: RootSnapshot::new(root_id.clone(), PathBuf::from("/tmp/root")),
+            children: Some(vec![file_entry(&file_path)]),
+            directory_states: Default::default(),
+            truncated: false,
+        }];
+
+        apply_metadata_capabilities_to_file_list_snapshots(&mut snapshots, &[record]);
+
+        let entry = snapshots[0]
+            .children
+            .as_ref()
+            .and_then(|children| children.first())
+            .expect("file entry");
+        assert_eq!(
+            entry
+                .scriptmeta_item
+                .as_ref()
+                .map(|item| item.script_id.as_str()),
+            Some("sample")
+        );
+        assert!(entry.has_scriptmeta);
+        assert!(entry.can_edit_scriptmeta);
+    }
+
+    #[test]
+    fn decodes_all_cache_with_file_list_snapshots_only() {
+        let data = serde_json::json!({
+            "file_list_snapshots": {}
+        });
+
+        let cache = decode_all_cache_data(data).expect("decode all cache");
+
+        assert!(cache.catalog.is_none());
+        assert!(cache.file_list_snapshots.is_empty());
+    }
+
+    fn file_entry(path: &Path) -> FileSystemEntry {
+        FileSystemEntry {
+            display_path: path.to_path_buf(),
+            resolved_path: path.to_path_buf(),
+            path_kind: PathKind::Normal,
+            resolution_status: PathResolutionStatus::Resolved,
+            resolution_message: None,
+            is_directory: false,
+            file_size: None,
+            content_modified_at: None,
+            identity: None,
+            runtime_kind: None,
+            shebang: None,
+            has_scriptmeta: false,
+            has_scriptmeta_edit_password: false,
+            is_file_locked: false,
+            is_read_only: false,
+            can_edit_scriptmeta: false,
+            can_append_scriptmeta: false,
+            scriptmeta_edit_state: ScriptMetaEditState::Unknown,
+            scriptmeta_item: None,
+            children: Vec::new(),
+        }
+    }
+
+    fn script_item_at_path(
+        script_id: &str,
+        root_id: &RootId,
+        file_path: &Path,
+    ) -> Arc<ScriptMetaItem> {
+        Arc::new(ScriptMetaItem {
+            root_id: root_id.clone(),
+            file_path: file_path.to_path_buf(),
+            identity_path: file_path.to_path_buf(),
+            runtime_kind: None,
+            shebang: None,
+            script_id: script_id.to_string(),
+            version: Some("1.0.0".to_string()),
+            description: None,
+            target_app: None,
+            min_target_version: None,
+            meta_url: None,
+            name: Some("Sample Script".to_string()),
             author: None,
             release_date: None,
             edit_password_sha256: None,

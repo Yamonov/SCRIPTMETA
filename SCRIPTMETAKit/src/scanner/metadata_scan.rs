@@ -19,6 +19,11 @@ use crate::{
         ScriptRuntimeKind, VersionOrdering, compare_versions, decode_script_text,
         parse_script_metadata,
     },
+    formats::{
+        compiled_osa, detect_script_file, has_scriptmeta_tag, is_script_package_path,
+        scriptmeta_edit_capability_from_cached_metadata,
+        scriptmeta_edit_capability_from_file_list_probe, scriptmeta_edit_capability_from_metadata,
+    },
     now_timestamp_millis,
     scanner::{ExtensionPolicy, ScannerOptions},
     watcher::normalize_path,
@@ -28,14 +33,10 @@ use super::path_resolution::{
     PathKind, PathResolutionStatus, path_error_status, resolve_scannable_path,
 };
 use super::{
-    compiled_osa::{self, CompiledOsaErrorKind},
     file_list::{file_identity, system_time_millis},
     root_preflight::{root_content_preflight_issue, root_location_issue},
-    script_detection::{
-        detect_script_file, has_scriptmeta_tag, scriptmeta_edit_capability_from_cached_metadata,
-        scriptmeta_edit_capability_from_file_list_probe, scriptmeta_edit_capability_from_metadata,
-    },
 };
+use crate::formats::compiled_osa::CompiledOsaErrorKind;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CandidateCache {
@@ -324,6 +325,7 @@ fn scan_metadata_root<'a>(
         started,
         visited_directories: BTreeSet::new(),
         visited_nodes: 0,
+        scanned_nodes: 0,
         limit_hit: None,
         timed_out: false,
         cancelled: false,
@@ -515,6 +517,7 @@ struct MetadataWalkState<'a> {
     started: Instant,
     visited_directories: BTreeSet<PathBuf>,
     visited_nodes: usize,
+    scanned_nodes: usize,
     limit_hit: Option<MetadataScanLimit>,
     timed_out: bool,
     cancelled: bool,
@@ -577,6 +580,7 @@ fn scan_directory(
         if should_stop(depth, state) {
             return;
         }
+        state.scanned_nodes = state.scanned_nodes.saturating_add(1);
 
         let source_path = entry.path();
         let display_path = display_directory.join(entry.file_name());
@@ -990,7 +994,7 @@ fn should_stop(depth: usize, state: &mut MetadataWalkState<'_>) -> bool {
         return true;
     }
 
-    if state.visited_nodes >= state.options.max_nodes_per_root {
+    if state.scanned_nodes >= state.options.max_nodes_per_root {
         state.limit_hit = Some(MetadataScanLimit::MaxNodes);
         return true;
     }
@@ -1022,12 +1026,6 @@ fn is_package_path(path: &Path) -> bool {
         path.extension().and_then(|extension| extension.to_str()),
         Some("app" | "bundle" | "framework" | "plugin" | "appex")
     )
-}
-
-fn is_script_package_path(path: &Path) -> bool {
-    path.extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("scptd"))
 }
 
 fn missing_root_error() -> RootError {
@@ -1159,5 +1157,30 @@ fn should_replace_item(current: &ScriptMetaItem, candidate: &ScriptMetaItem) -> 
             }
         }
         (None, None) => candidate.file_path < current.file_path,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn metadata_node_limit_counts_non_script_entries() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        fs::write(directory.path().join("one.txt"), "one").expect("write one");
+        fs::write(directory.path().join("two.txt"), "two").expect("write two");
+        let root = RootRegistration::file_list_and_metadata(RootId::from("root"), directory.path());
+
+        let options = ScannerOptions {
+            max_nodes_per_root: 1,
+            ..Default::default()
+        };
+        let output =
+            scan_metadata_roots([&root], &options, &ExtensionPolicy::script_default(), None);
+
+        assert_eq!(output.roots[0].status, RootStatus::Overflowed);
+        assert_eq!(output.roots[0].item_count, 0);
+        assert!(output.candidate_cache.records.is_empty());
     }
 }

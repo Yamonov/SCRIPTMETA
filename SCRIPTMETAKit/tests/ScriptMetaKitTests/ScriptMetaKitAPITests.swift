@@ -265,7 +265,7 @@ final class ScriptMetaKitAPITests: XCTestCase {
         XCTAssertFalse(result.fileStateFingerprint.isEmpty)
     }
 
-    func testScanReportsFileIssuesThroughSwiftAPI() async throws {
+    func testScanReportsObfuscatedEditStateThroughSwiftAPI() async throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("ScriptMetaKitAPITests-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -278,7 +278,10 @@ final class ScriptMetaKitAPITests: XCTestCase {
         engine.cancelCurrentOperation()
         let result = try await engine.scan(folderURL: root, checkUpdates: false)
 
-        XCTAssertTrue(result.fileIssues?.contains { $0.code == "binary_or_obfuscated" && $0.path == script.path } ?? false)
+        let entry = try XCTUnwrap(result.flattenedFileEntries.first { $0.displayPath == script.path })
+        XCTAssertEqual(entry.scriptMetaEditState, "obfuscated")
+        XCTAssertFalse(entry.canEditScriptMeta)
+        XCTAssertFalse(entry.canAppendScriptMeta)
     }
 
     private func makeTemporaryScriptRoot(scriptID: String = "com.example.swiftapi.scan") throws -> URL {
