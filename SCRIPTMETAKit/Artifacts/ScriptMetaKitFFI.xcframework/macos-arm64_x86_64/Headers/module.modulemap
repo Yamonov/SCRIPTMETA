@@ -1,4 +1,0 @@
-module ScriptMetaKitFFI {
-  header "scriptmetakit_ffi.h"
-  export *
-}
